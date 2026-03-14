@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: uae-compliance-scanner
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn uae_compliance_scanner:app
+    plan: free
