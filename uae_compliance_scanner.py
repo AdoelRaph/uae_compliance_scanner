@@ -32,15 +32,15 @@ app = Flask(__name__)
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 MODELS = {
-    "regulations": "perplexity/sonar-pro",
-    "enforcement": "x-ai/grok-3",
-    "audit":       "anthropic/claude-sonnet-4-5",
+    "regulations": "perplexity/sonar-deep-research",
+    "enforcement": "x-ai/grok-4.20-multi-agent-beta",
+    "audit":       "anthropic/claude-sonnet-4-6",
 }
 
 MODEL_PRICING = {
-    "perplexity/sonar-pro":        {"input": 3.00,  "output": 15.00},
-    "x-ai/grok-3":                 {"input": 3.00,  "output": 15.00},
-    "anthropic/claude-sonnet-4-5": {"input": 3.00,  "output": 15.00},
+    "perplexity/sonar-deep-research":    {"input": 3.00,  "output": 15.00},
+    "x-ai/grok-4.20-multi-agent-beta":   {"input": 3.00,  "output": 15.00},
+    "anthropic/claude-sonnet-4-6":       {"input": 3.00,  "output": 15.00},
 }
 
 UAE_FRAMEWORKS = [
@@ -72,7 +72,7 @@ def openrouter_chat(api_key, model, messages):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://uae-compliance-scanner.local",
-        "X-Title": "UAE Compliance Scanner",
+        "X-OpenRouter-Title": "UAE Compliance Scanner",
     }
     body = {
         "model": model,
@@ -83,7 +83,7 @@ def openrouter_chat(api_key, model, messages):
     r = http_requests.post(
         f"{OPENROUTER_BASE}/chat/completions",
         headers=headers,
-        json=body,
+        data=json.dumps(body),
         timeout=180,
     )
     r.raise_for_status()
@@ -453,7 +453,6 @@ def render_report(violations, enforcements, regulations,
             except (ValueError, TypeError):
                 fine_usd = str(e.get("fine_amount_usd", "N/A"))
 
-            # Match to code violations by keyword
             enf_text = str(e.get("violation","")).lower()
             kws = ["pdpl","aml","vara","cbuae","kyc","data protection","privacy",
                    "sanction","compliance","adgm","difc","nesa","sca","tax"]
@@ -522,7 +521,6 @@ def render_report(violations, enforcements, regulations,
     h.append('<div class="roi-wrap">')
     h.append('<div class="roi-title">📈 Scan Cost vs. Regulatory Risk</div>')
 
-    # Top stat cells
     h.append('<div class="roi-grid">')
     h.append(f'<div class="roi-cell"><div class="roi-cell-label">Scan Cost (You Paid)</div>'
              f'<div class="roi-cell-val roi-green">${total_cost:.4f}</div></div>')
@@ -545,7 +543,6 @@ def render_report(violations, enforcements, regulations,
     else:
         h.append('<div class="roi-sub">No fine data available for ROI calculation.</div>')
 
-    # Token breakdown table
     h.append('<div style="margin-top:20px;overflow-x:auto">')
     h.append('<table class="token-table">')
     h.append('<tr><th>Model</th><th>Input Tokens</th><th>Output Tokens</th>'
@@ -608,18 +605,17 @@ def stream_scan(repo_url, pat, api_key):
 <div class="progress-box" id="pb">
 """
 
-    clone_dir    = None
-    total_in     = 0
-    total_out    = 0
-    total_cost   = 0.0
+    clone_dir     = None
+    total_in      = 0
+    total_out     = 0
+    total_cost    = 0.0
     cost_by_model = {}
     all_violations = []
-    regulations  = []
-    enforcements = []
-    errors       = []
-    num_files    = 0
+    regulations   = []
+    enforcements  = []
+    errors        = []
+    num_files     = 0
 
-    # Build the static framework list string for the audit prompt
     fw_list = "\n".join(
         f"{n}. {name} — {desc}"
         for n, name, desc in UAE_FRAMEWORKS
@@ -647,8 +643,8 @@ def stream_scan(repo_url, pat, api_key):
         if num_files == 0:
             yield _p("pline-err", "⚠ No .py / .js / .ts / .sol files found.")
 
-        # ── Step 2: Perplexity — new regulations ───────────────────────────────
-        yield _p("pline-work", "⏳ Step 2/5: Fetching new UAE regulatory updates (Perplexity Sonar Pro)…")
+        # ── Step 2: Perplexity Deep Research — new regulations ─────────────────
+        yield _p("pline-work", "⏳ Step 2/5: Fetching new UAE regulatory updates (Perplexity Sonar Deep Research)…")
         try:
             content, inp, out = openrouter_chat(api_key, MODELS["regulations"], [
                 {"role": "system",
@@ -684,8 +680,8 @@ def stream_scan(repo_url, pat, api_key):
             errors.append(f"Perplexity error: {exc}")
             yield _p("pline-err", f"⚠ Perplexity failed: {escape(str(exc)[:300])}")
 
-        # ── Step 3: Grok — trending enforcement ────────────────────────────────
-        yield _p("pline-work", "⏳ Step 3/5: Fetching trending UAE enforcement actions (Grok 3)…")
+        # ── Step 3: Grok 4 Multi-Agent — trending enforcement ─────────────────
+        yield _p("pline-work", "⏳ Step 3/5: Fetching trending UAE enforcement actions (Grok 4 Multi-Agent)…")
         try:
             content, inp, out = openrouter_chat(api_key, MODELS["enforcement"], [
                 {"role": "system",
@@ -738,10 +734,10 @@ def stream_scan(repo_url, pat, api_key):
         if not additional_regs.strip():
             additional_regs = "None available — use hardcoded frameworks only."
 
-        # ── Step 4: Claude — code audit ────────────────────────────────────────
+        # ── Step 4: Claude Sonnet 4.6 — code audit ────────────────────────────
         yield _p("pline-work",
                  f"⏳ Step 4/5: Auditing {num_files} file(s) against "
-                 f"10 UAE laws + trending + new regulations (Claude Sonnet 4.5)…")
+                 f"10 UAE laws + trending + new regulations (Claude Sonnet 4.6)…")
 
         audit_system = f"""You are a senior UAE financial compliance auditor and code security expert.
 
