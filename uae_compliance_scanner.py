@@ -168,13 +168,18 @@ class RateLimitError(OpenRouterError):
 
 
 def _single_chat_call(
-    api_key: str,
-    model:   str,
+    api_key:  str,
+    model:    str,
     messages: list[dict],
+    timeout:  int = 180,
 ) -> tuple[str, int, int]:
     """
     Execute one (non-retried) OpenRouter chat completion call.
     Applies the global rate limiter before the request.
+
+    Args:
+        timeout: HTTP timeout in seconds.
+                 Use 45 for demo/free models, 180 for paid models.
 
     Returns: (content, input_tokens, output_tokens)
     Raises:  RateLimitError on 429, OpenRouterError on all other failures.
@@ -199,10 +204,10 @@ def _single_chat_call(
             f"{OPENROUTER_BASE}/chat/completions",
             headers=headers,
             data=json.dumps(body),
-            timeout=180,
+            timeout=timeout,
         )
     except http_requests.exceptions.Timeout as exc:
-        raise OpenRouterError(f"Request timed out after 180 s: {exc}") from exc
+        raise OpenRouterError(f"Request timed out after {timeout} s: {exc}") from exc
     except http_requests.exceptions.ConnectionError as exc:
         raise OpenRouterError(f"Connection error: {exc}") from exc
 
@@ -230,6 +235,7 @@ def openrouter_chat(
     messages:      list[dict],
     pricing_table: dict | None = None,
     max_retries:   int = 5,
+    timeout:       int = 180,
 ) -> tuple[str, int, int, str]:
     """
     Retrying OpenRouter call with exponential backoff and automatic model fallback.
@@ -237,6 +243,9 @@ def openrouter_chat(
     Retry schedule per model: 1 s → 2 s → 4 s → 8 s → 16 s
     If all retries for the primary model fail, the next model in
     FALLBACK_CHAINS is tried from scratch (same retry schedule).
+
+    Args:
+        timeout: Per-attempt HTTP timeout in seconds (45 for demo, 180 for full).
 
     Returns: (content, input_tokens, output_tokens, model_actually_used)
     Raises:  OpenRouterError when every model in the chain is exhausted.
@@ -252,18 +261,18 @@ def openrouter_chat(
         delay = 1.0
         for attempt in range(1, max_retries + 1):
             try:
-                content, inp, out = _single_chat_call(api_key, candidate, messages)
+                content, inp, out = _single_chat_call(
+                    api_key, candidate, messages, timeout=timeout
+                )
                 return content, inp, out, candidate
 
             except RateLimitError as exc:
                 last_exc = exc
                 if attempt == max_retries:
-                    # Exhausted retries for this model — try next fallback
                     break
-                # Respect any Retry-After header if present (not always sent)
-                sleep_for = delay + (delay * 0.15)   # 15 % jitter
+                sleep_for = delay + (delay * 0.15)   # 15% jitter
                 time.sleep(sleep_for)
-                delay = min(delay * 2, 30.0)          # cap at 30 s
+                delay = min(delay * 2, 30.0)
 
             except OpenRouterError as exc:
                 last_exc = exc
@@ -450,12 +459,16 @@ def audit_file_batch(
     system_prompt: str,
     pricing_table: dict,
     stats:         ScanStats,
+    timeout:       int = 180,
 ) -> tuple[list[dict], int, int, str]:
     """
     Audit a batch of files in a single API call.
 
     Combines all files into one user message, reducing total API round-trips.
     Handles fallback model promotion transparently via openrouter_chat().
+
+    Args:
+        timeout: HTTP timeout per attempt (45 for demo, 180 for full scan).
 
     Returns: (violations, input_tokens, output_tokens, model_used)
     On failure returns: ([], 0, 0, model) and updates stats accordingly.
@@ -485,6 +498,7 @@ def audit_file_batch(
                 {"role": "user",   "content": combined_prompt},
             ],
             pricing_table=pricing_table,
+            timeout=timeout,
         )
 
         # Track if a fallback was promoted
@@ -689,6 +703,13 @@ h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FLUSH_PAD      = "<!-- " + ("x" * 1024) + " -->\n"
+
+# Per-line flush padding: browsers buffer until they receive enough bytes.
+# Appending ~512 bytes of HTML comment after every progress line forces
+# Chrome/Firefox/Safari to paint it immediately rather than waiting for the
+# next network packet.  Invisible to the user, critical for live streaming.
+_LINE_FLUSH = "<!-- " + ("f" * 512) + " -->\n"
+
 FRAMEWORKS_HTML = "".join(
     f'<span class="fw-pill" title="{escape(desc)}">#{n} {escape(name)}</span>'
     for n, name, desc in UAE_FRAMEWORKS
@@ -696,8 +717,8 @@ FRAMEWORKS_HTML = "".join(
 
 
 def _p(cls: str, msg: str) -> str:
-    """Render one progress line."""
-    return f'<div class="pline {cls}">{msg}</div>\n'
+    """Render one progress line with a flush pad so the browser paints it immediately."""
+    return f'<div class="pline {cls}">{msg}</div>\n{_LINE_FLUSH}'
 
 
 def _badge(severity: str) -> str:
@@ -1235,6 +1256,10 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         for n, name, desc in UAE_FRAMEWORKS
     )
 
+    # Demo mode: use a 45 s per-call timeout so a slow free model doesn't hang
+    # the entire scan for 3 minutes.  Full BYOK scan keeps the full 180 s.
+    api_timeout = 45 if is_demo else 180
+
     def accumulate_cost(model_id: str, inp: int, out: int) -> None:
         """Thread-safe cost accumulation helper (single-threaded here, but explicit)."""
         nonlocal total_in, total_out, total_cost
@@ -1306,6 +1331,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     },
                 ],
                 pricing_table=pricing,
+                timeout=api_timeout,
             )
             accumulate_cost(reg_model_used, reg_inp, reg_out)
 
@@ -1363,6 +1389,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     },
                 ],
                 pricing_table=pricing,
+                timeout=api_timeout,
             )
             accumulate_cost(enf_model_used, enf_inp, enf_out)
 
@@ -1435,6 +1462,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                 audit_system,
                 pricing,
                 stats,
+                timeout=api_timeout,
             )
 
             if model_used != audit_model and model_used != audit_model:
