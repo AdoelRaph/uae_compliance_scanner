@@ -4,15 +4,9 @@ UAE Compliance Scanner — Production-Ready
 Single-file Flask app — scans GitHub repos for UAE regulatory compliance violations.
 Uses OpenRouter (https://openrouter.ai/api/v1) to access Perplexity, Grok, and Claude.
 
-Improvements over v1:
-  - Global rate limiter: max 1 request/second (thread-safe)
-  - Exponential backoff retry: 1s→2s→4s→8s→16s (max 5 attempts per call)
-  - Fallback model chain: if primary fails repeatedly, promotes to next model
-  - File batching: N files per audit call (cuts total API calls by ~3x)
-  - Scan health tracking: successful / failed / rate-limited batches
-  - "Audit incomplete due to rate limits" banner when applicable
-  - Clean separation: RateLimiter · OpenRouterClient · AuditPipeline
-  - All error paths report accurately; "0 violations" only when scan truly completed
+Demo mode  : openrouter/auto:free — $0.00 billed, OpenRouter auto-selects best free model
+Full mode  : Perplexity + Grok + Claude (paid BYOK)
+Fallback   : paid chain → claude-sonnet → openrouter/auto:free as last resort
 
 Requirements:
     pip install flask requests gitpython
@@ -46,8 +40,8 @@ OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 MAX_FILES       = 50
 MAX_DEMO_FILES  = 5
-MAX_FILE_CHARS  = 18_000   # per file; reduced so batches stay inside context limits
-BATCH_SIZE      = 3        # files per audit API call (demo: 2 to ease free-tier load)
+MAX_FILE_CHARS  = 18_000
+BATCH_SIZE      = 3
 DEMO_BATCH_SIZE = 2
 
 TARGET_EXTENSIONS = {".py", ".js", ".ts", ".sol"}
@@ -76,41 +70,31 @@ MODEL_PRICING = {
     "anthropic/claude-sonnet-4-6":     {"input": 3.00, "output": 15.00},
 }
 
-# Demo free-tier scan — all :free models, $0 billed to user
+# Demo free-tier scan — openrouter/auto:free for all roles, $0 billed to user.
+# OpenRouter auto-selects the best available free model per request.
 DEMO_MODELS = {
-    "regulations": "nvidia/nemotron-3-super-120b-a12b:free",
-    "enforcement": "meta-llama/llama-3.3-70b-instruct:free",
-    "audit":       "qwen/qwen3-coder:free",
+    "regulations": "openrouter/auto:free",
+    "enforcement": "openrouter/auto:free",
+    "audit":       "openrouter/auto:free",
 }
 
 DEMO_MODEL_PRICING = {
-    "nvidia/nemotron-3-super-120b-a12b:free":  {"input": 0.0, "output": 0.0},
-    "meta-llama/llama-3.3-70b-instruct:free":  {"input": 0.0, "output": 0.0},
-    "qwen/qwen3-coder:free":                   {"input": 0.0, "output": 0.0},
-    "deepseek/deepseek-r1:free":               {"input": 0.0, "output": 0.0},
-    "mistralai/mistral-7b-instruct:free":      {"input": 0.0, "output": 0.0},
+    "openrouter/auto:free": {"input": 0.0, "output": 0.0},
 }
 
-# Fallback chains: on repeated failure the client walks down this list
+# Fallback chains:
+#   Demo  — openrouter/auto:free handles everything; no further fallback needed
+#           (OpenRouter itself load-balances across all available free models)
+#   Full  — paid chain walks to claude-sonnet, then drops to free auto-router
+#           as an absolute last resort so the scan never returns nothing
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Demo audit chain: qwen → deepseek → mistral
-    "qwen/qwen3-coder:free": [
-        "deepseek/deepseek-r1:free",
-        "mistralai/mistral-7b-instruct:free",
-    ],
-    # Demo regulations/enforcement chains
-    "nvidia/nemotron-3-super-120b-a12b:free": [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "mistralai/mistral-7b-instruct:free",
-    ],
-    "meta-llama/llama-3.3-70b-instruct:free": [
-        "nvidia/nemotron-3-super-120b-a12b:free",
-        "mistralai/mistral-7b-instruct:free",
-    ],
+    # Demo
+    "openrouter/auto:free": [],
+
     # Paid fallbacks
-    "perplexity/sonar-deep-research":  ["anthropic/claude-sonnet-4-6"],
-    "x-ai/grok-4.20-multi-agent-beta": ["anthropic/claude-sonnet-4-6"],
-    "anthropic/claude-sonnet-4-6":     [],
+    "perplexity/sonar-deep-research":  ["anthropic/claude-sonnet-4-6", "openrouter/auto:free"],
+    "x-ai/grok-4.20-multi-agent-beta": ["anthropic/claude-sonnet-4-6", "openrouter/auto:free"],
+    "anthropic/claude-sonnet-4-6":     ["openrouter/auto:free"],
 }
 
 UAE_FRAMEWORKS = [
@@ -143,7 +127,6 @@ class RateLimiter:
         self._min_interval = min_interval
 
     def wait(self) -> None:
-        """Block the calling thread until the minimum interval has elapsed."""
         with self._lock:
             now     = time.monotonic()
             elapsed = now - self._last_call_at
@@ -152,7 +135,6 @@ class RateLimiter:
             self._last_call_at = time.monotonic()
 
 
-# Single shared instance — all API calls go through this
 _rate_limiter = RateLimiter(min_interval=1.1)
 
 
@@ -176,10 +158,6 @@ def _single_chat_call(
     """
     Execute one (non-retried) OpenRouter chat completion call.
     Applies the global rate limiter before the request.
-
-    Args:
-        timeout: HTTP timeout in seconds.
-                 Use 45 for demo/free models, 180 for paid models.
 
     Returns: (content, input_tokens, output_tokens)
     Raises:  RateLimitError on 429, OpenRouterError on all other failures.
@@ -244,9 +222,6 @@ def openrouter_chat(
     If all retries for the primary model fail, the next model in
     FALLBACK_CHAINS is tried from scratch (same retry schedule).
 
-    Args:
-        timeout: Per-attempt HTTP timeout in seconds (45 for demo, 180 for full).
-
     Returns: (content, input_tokens, output_tokens, model_actually_used)
     Raises:  OpenRouterError when every model in the chain is exhausted.
     """
@@ -270,7 +245,7 @@ def openrouter_chat(
                 last_exc = exc
                 if attempt == max_retries:
                     break
-                sleep_for = delay + (delay * 0.15)   # 15% jitter
+                sleep_for = delay + (delay * 0.15)
                 time.sleep(sleep_for)
                 delay = min(delay * 2, 30.0)
 
@@ -299,13 +274,11 @@ def extract_json(text: str):
     """
     text = text.strip()
 
-    # Attempt 1 — raw parse
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Attempt 2 — strip markdown code fences
     for pat in [r"```json\s*\n([\s\S]*?)\n\s*```", r"```\s*\n([\s\S]*?)\n\s*```"]:
         m = re.search(pat, text)
         if m:
@@ -314,7 +287,6 @@ def extract_json(text: str):
             except (json.JSONDecodeError, ValueError):
                 continue
 
-    # Attempt 3 — find outermost [] or {} substring
     for pat in [r"(\[[\s\S]*\])", r"(\{[\s\S]*\})"]:
         m = re.search(pat, text)
         if m:
@@ -373,19 +345,14 @@ def make_batches(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ScanStats:
-    """
-    Accumulates audit health data across the full scan run.
-    Used to decide whether to display "Audit incomplete" warnings.
-    """
+    """Accumulates audit health data across the full scan run."""
 
     def __init__(self) -> None:
-        self.successful_batches:  int = 0
-        self.failed_batches:      int = 0
-        self.rate_limit_hits:     int = 0
+        self.successful_batches:   int = 0
+        self.failed_batches:       int = 0
+        self.rate_limit_hits:      int = 0
         self.fallback_activations: int = 0
-        self.models_used: dict[str, int] = {}   # model_id → call count
-
-    # ── Convenience checks ────────────────────────────────────────────────────
+        self.models_used: dict[str, int] = {}
 
     @property
     def is_incomplete(self) -> bool:
@@ -394,8 +361,6 @@ class ScanStats:
     @property
     def total_batches(self) -> int:
         return self.successful_batches + self.failed_batches
-
-    # ── Mutation helpers ──────────────────────────────────────────────────────
 
     def record_success(self, model_id: str) -> None:
         self.successful_batches += 1
@@ -408,8 +373,6 @@ class ScanStats:
 
     def record_fallback(self) -> None:
         self.fallback_activations += 1
-
-    # ── Summary string ────────────────────────────────────────────────────────
 
     def summary(self) -> str:
         parts = [f"✅ {self.successful_batches}/{self.total_batches} batch(es) succeeded"]
@@ -427,7 +390,6 @@ class ScanStats:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_audit_system_prompt(fw_list: str, additional_regs: str) -> str:
-    """Return the system prompt used for all code audit calls."""
     return f"""You are a senior UAE financial compliance auditor and code security expert.
 
 Audit the provided source code files against ALL of the following 10 UAE regulatory frameworks:
@@ -463,17 +425,9 @@ def audit_file_batch(
 ) -> tuple[list[dict], int, int, str]:
     """
     Audit a batch of files in a single API call.
-
-    Combines all files into one user message, reducing total API round-trips.
-    Handles fallback model promotion transparently via openrouter_chat().
-
-    Args:
-        timeout: HTTP timeout per attempt (45 for demo, 180 for full scan).
-
     Returns: (violations, input_tokens, output_tokens, model_used)
     On failure returns: ([], 0, 0, model) and updates stats accordingly.
     """
-    # Build combined user message: one block per file
     file_blocks: list[str] = []
     for full_path, rel_path in batch:
         source = read_file_safe(full_path)
@@ -481,7 +435,6 @@ def audit_file_batch(
             file_blocks.append(f"=== FILE: {rel_path} ===\n```\n{source}\n```")
 
     if not file_blocks:
-        # All files in batch were empty — skip without counting as failure
         return [], 0, 0, model
 
     combined_prompt = (
@@ -501,11 +454,9 @@ def audit_file_batch(
             timeout=timeout,
         )
 
-        # Track if a fallback was promoted
         if model_used != model:
             stats.record_fallback()
 
-        # Parse the response
         violations: list[dict] = []
         parsed = extract_json(content)
         if isinstance(parsed, list):
@@ -518,7 +469,7 @@ def audit_file_batch(
         stats.record_success(model_used)
         return violations, inp, out, model_used
 
-    except RateLimitError as exc:
+    except RateLimitError:
         stats.record_failure(rate_limited=True)
         return [], 0, 0, model
 
@@ -528,7 +479,7 @@ def audit_file_batch(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — CSS (unchanged from v1)
+# SECTION 6 — CSS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CSS = """
@@ -702,12 +653,7 @@ h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
 # SECTION 7 — HTML Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-FLUSH_PAD      = "<!-- " + ("x" * 1024) + " -->\n"
-
-# Per-line flush padding: browsers buffer until they receive enough bytes.
-# Appending ~512 bytes of HTML comment after every progress line forces
-# Chrome/Firefox/Safari to paint it immediately rather than waiting for the
-# next network packet.  Invisible to the user, critical for live streaming.
+FLUSH_PAD = "<!-- " + ("x" * 1024) + " -->\n"
 _LINE_FLUSH = "<!-- " + ("f" * 512) + " -->\n"
 
 FRAMEWORKS_HTML = "".join(
@@ -717,7 +663,6 @@ FRAMEWORKS_HTML = "".join(
 
 
 def _p(cls: str, msg: str) -> str:
-    """Render one progress line with a flush pad so the browser paints it immediately."""
     return f'<div class="pline {cls}">{msg}</div>\n{_LINE_FLUSH}'
 
 
@@ -744,19 +689,19 @@ def _card_cls(severity: str) -> str:
 def index_html() -> str:
     demo_section = f"""
 <div class="demo-card">
-  <h2>⚡ Free-Model Demo — Runs on Open-Source AI</h2>
+  <h2>⚡ Free-Model Demo — Powered by OpenRouter Auto-Router</h2>
   <div class="demo-badge-row">
     <span class="demo-badge">🆓 Free-tier models ($0 cost)</span>
     <span class="demo-badge">🔒 Public repos only</span>
     <span class="demo-badge">📄 First {MAX_DEMO_FILES} files scanned</span>
     <span class="demo-badge">🔑 Your key required</span>
-    <span class="demo-badge">🔀 Auto-fallback on rate limits</span>
+    <span class="demo-badge">🤖 Auto best-model selection</span>
   </div>
   <div class="demo-warning">
     ⚠ <strong>Rate limits:</strong> Free-tier models on OpenRouter allow
     20 requests/min · 200 requests/day per key. The scanner automatically
-    retries with exponential backoff and switches to fallback models if
-    rate limits are hit. Files are batched to minimise total API calls.
+    retries with exponential backoff. OpenRouter's auto-router picks the
+    least-loaded free model on every request.
     <strong>You will NOT be charged anything.</strong>
     <a href="https://openrouter.ai/keys" target="_blank" style="color:#58a6ff">
       Get a free key →
@@ -784,18 +729,17 @@ def index_html() -> str:
     <p class="hint">
       <strong>Free models require your own OpenRouter key.</strong>
       <a href="https://openrouter.ai/keys" target="_blank">Get one free (30 seconds) →</a><br>
-      <strong style="color:#3fb950">$0.00 billed</strong> — all models are
-      <code>:free</code> tier. Key is used only for rate limiting.<br>
-      Fallback chain: <code>qwen3-coder → deepseek-r1 → mistral-7b</code>
+      <strong style="color:#3fb950">$0.00 billed</strong> — all calls use
+      <code>openrouter/auto:free</code>, OpenRouter picks the best available free model per request.<br>
     </p>
     <div style="background:#0d1117;border:1px solid #30363d;border-radius:7px;
                 padding:10px 14px;margin-bottom:16px;font-size:.78rem;color:#8b949e">
       <strong style="color:#c9d1d9">Models (all :free — $0.00 billed):</strong><br>
-      Regulations: <span class="model-pill model-pill-free">nemotron-3-super-120b:free</span>
-      &nbsp; Enforcement: <span class="model-pill model-pill-free">llama-3.3-70b:free</span>
-      &nbsp; Audit: <span class="model-pill model-pill-free">qwen3-coder:free</span><br>
+      Regulations: <span class="model-pill model-pill-free">openrouter/auto:free</span>
+      &nbsp; Enforcement: <span class="model-pill model-pill-free">openrouter/auto:free</span>
+      &nbsp; Audit: <span class="model-pill model-pill-free">openrouter/auto:free</span><br>
       <span style="color:#484f58;font-size:.72rem">
-        Fallbacks: deepseek-r1:free → mistral-7b:free
+        OpenRouter auto-selects the best available free model per request
       </span>
     </div>
     <button type="submit" class="btn-demo" id="dbtn">
@@ -824,7 +768,7 @@ def index_html() -> str:
   Scan any GitHub repository against <strong>10 UAE regulatory frameworks</strong>
   + live enforcement actions + regulatory updates.<br>
   Powered by <strong>Perplexity · Grok · Claude</strong> via OpenRouter.
-  Auto-retry · Rate-limit recovery · Fallback models · Never stores credentials.
+  Auto-retry · Rate-limit recovery · Free fallback safety net · Never stores credentials.
 </p>
 <div style="margin-bottom:28px">
   <p style="color:#8b949e;font-size:.8rem;margin-bottom:8px;text-transform:uppercase;
@@ -853,7 +797,8 @@ def index_html() -> str:
            placeholder="sk-or-v1-xxxxxxxxxxxxxxxxxxxx" required autocomplete="off">
     <p class="hint">
       Routes to Perplexity + Grok + Claude automatically.
-      <a href="https://openrouter.io/keys" target="_blank">Get your key →</a>
+      Falls back to <code>openrouter/auto:free</code> if paid models fail.
+      <a href="https://openrouter.ai/keys" target="_blank">Get your key →</a>
     </p>
     <button type="submit" class="btn-scan" id="btn">🔍 Start Full Compliance Scan</button>
   </form>
@@ -897,7 +842,7 @@ def render_report(
 <div class="demo-scan-banner">
   <span style="font-size:1.4rem">⚡</span>
   <div>
-    <strong>Demo Scan</strong> — free open-source models ·
+    <strong>Demo Scan</strong> — openrouter/auto:free · auto best-model selection ·
     first {MAX_DEMO_FILES} files · <strong>$0.00 billed</strong><br>
     <span style="color:#8b949e">{stats.summary()}</span>
   </div>
@@ -911,8 +856,7 @@ def render_report(
   <span style="font-size:1.4rem">⚠</span>
   <div>
     <strong>Audit incomplete due to rate limits</strong> —
-    {stats.failed_batches} batch(es) could not be audited after all retries
-    and fallbacks were exhausted.<br>
+    {stats.failed_batches} batch(es) could not be audited after all retries exhausted.<br>
     Violations below reflect only the {stats.successful_batches} successfully audited batch(es).
     Re-run the scan or wait a few minutes and try again.
   </div>
@@ -978,7 +922,7 @@ def render_report(
         )
 
     # ── Enforcement actions ────────────────────────────────────────────────────
-    enf_label = "(via Llama 3.3 70B — demo)" if is_demo else "(via Grok — trending)"
+    enf_label = "(via openrouter/auto:free — demo)" if is_demo else "(via Grok — trending)"
     h.append(
         f'<h2 class="section">⚖ Recent UAE Enforcement Actions '
         f'<span style="font-size:.75rem;color:#8b949e;font-weight:400">{enf_label}</span></h2>'
@@ -1032,7 +976,7 @@ def render_report(
         h.append('<div class="card">No enforcement data retrieved.</div>')
 
     # ── Regulatory updates ─────────────────────────────────────────────────────
-    reg_label = "(via Nemotron — demo)" if is_demo else "(via Perplexity)"
+    reg_label = "(via openrouter/auto:free — demo)" if is_demo else "(via Perplexity)"
     h.append(
         f'<h2 class="section">📜 New UAE Regulatory Updates '
         f'<span style="font-size:.75rem;color:#8b949e;font-weight:400">{reg_label}</span></h2>'
@@ -1110,7 +1054,7 @@ def render_report(
     if is_demo and violations:
         h.append('<div class="roi-big" style="color:#3fb950">$0.00 ✓</div>')
         h.append(
-            '<div class="roi-sub">Free-tier models — $0.00 billed to your OpenRouter account. '
+            '<div class="roi-sub">Free-tier models via openrouter/auto:free — $0.00 billed. '
             'Run a <a href="/" style="color:#58a6ff">full BYOK scan</a> for complete coverage.</div>'
         )
     elif lowest_fine > 0 and violations:
@@ -1193,11 +1137,10 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
     """
     Core streaming scan generator.
 
-    is_demo=False  → full BYOK scan (paid models)
-    is_demo=True   → demo scan (free :free models, $0 billed, 5-file cap)
+    is_demo=False  → full BYOK scan (paid models; falls back to openrouter/auto:free)
+    is_demo=True   → demo scan (openrouter/auto:free for all roles, $0 billed, 5-file cap)
 
     Yields HTML chunks that build the page progressively.
-    Uses file batching + retry + fallback to handle free-tier rate limits.
     """
     models      = DEMO_MODELS        if is_demo else MODELS
     pricing     = DEMO_MODEL_PRICING if is_demo else MODEL_PRICING
@@ -1207,6 +1150,10 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
 
     page_title = "Demo Scan… — UAE Compliance Scanner" if is_demo else "Scanning… — UAE Compliance Scanner"
     scan_label = "Demo scan in progress…"              if is_demo else "Scan in progress…"
+
+    # Demo mode: 45 s per-call timeout (free models can be slow).
+    # Full BYOK scan: full 180 s.
+    api_timeout = 45 if is_demo else 180
 
     # ── Initial HTML skeleton ─────────────────────────────────────────────────
     yield f"""<!DOCTYPE html>
@@ -1230,9 +1177,9 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         yield f"""<div class="demo-scan-banner">
   <span style="font-size:1.3rem">⚡</span>
   <div>
-    <strong>Demo Mode</strong> — free open-source models ·
+    <strong>Demo Mode</strong> — openrouter/auto:free · auto best-model selection ·
     first {MAX_DEMO_FILES} files · batched {batch_size} files/call ·
-    auto-retry + fallback · <strong>$0.00 billed</strong>
+    auto-retry · <strong>$0.00 billed</strong>
   </div>
 </div>
 """
@@ -1240,28 +1187,23 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
     yield '<div class="progress-box" id="pb">\n'
 
     # ── Mutable state ─────────────────────────────────────────────────────────
-    clone_dir:     str | None   = None
-    total_in:      int          = 0
-    total_out:     int          = 0
-    total_cost:    float        = 0.0
-    cost_by_model: dict         = {}
+    clone_dir:      str | None  = None
+    total_in:       int         = 0
+    total_out:      int         = 0
+    total_cost:     float       = 0.0
+    cost_by_model:  dict        = {}
     all_violations: list[dict]  = []
-    regulations:   list[dict]   = []
-    enforcements:  list[dict]   = []
-    errors:        list[str]    = []
-    num_files:     int          = 0
+    regulations:    list[dict]  = []
+    enforcements:   list[dict]  = []
+    errors:         list[str]   = []
+    num_files:      int         = 0
 
     fw_list = "\n".join(
         f"{n}. {name} — {desc}"
         for n, name, desc in UAE_FRAMEWORKS
     )
 
-    # Demo mode: use a 45 s per-call timeout so a slow free model doesn't hang
-    # the entire scan for 3 minutes.  Full BYOK scan keeps the full 180 s.
-    api_timeout = 45 if is_demo else 180
-
     def accumulate_cost(model_id: str, inp: int, out: int) -> None:
-        """Thread-safe cost accumulation helper (single-threaded here, but explicit)."""
         nonlocal total_in, total_out, total_cost
         total_in  += inp
         total_out += out
@@ -1349,7 +1291,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                 yield _p("pline-info", "⚠ Regulations model returned unexpected format — continuing.")
             else:
                 fallback_note = (
-                    f' (fallback: <span class="model-pill model-pill-fallback">'
+                    f' (routed to: <span class="model-pill model-pill-fallback">'
                     f'{escape(reg_model_used)}</span>)'
                     if reg_model_used != reg_model else ""
                 )
@@ -1407,7 +1349,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                 yield _p("pline-info", "⚠ Enforcement model returned unexpected format — continuing.")
             else:
                 fallback_note = (
-                    f' (fallback: <span class="model-pill model-pill-fallback">'
+                    f' (routed to: <span class="model-pill model-pill-fallback">'
                     f'{escape(enf_model_used)}</span>)'
                     if enf_model_used != enf_model else ""
                 )
@@ -1449,7 +1391,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         )
 
         for batch_idx, batch in enumerate(batches):
-            batch_names = [rel for _, rel in batch]
+            batch_names   = [rel for _, rel in batch]
             names_escaped = ", ".join(
                 f'<span class="v-file">{escape(n)}</span>' for n in batch_names
             )
@@ -1465,15 +1407,14 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                 timeout=api_timeout,
             )
 
-            if model_used != audit_model and model_used != audit_model:
+            if model_used != audit_model:
                 yield _p(
                     "pline-info",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;🔀 Fallback activated: "
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;🔀 Routed to: "
                     f'<span class="model-pill model-pill-fallback">{escape(model_used)}</span>'
                 )
 
             if inp > 0:
-                # Successful batch
                 accumulate_cost(model_used, inp, out)
                 all_violations.extend(violations)
                 yield _p(
@@ -1481,11 +1422,10 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {len(violations)} violation(s) found in this batch."
                 )
             else:
-                # Failed batch — stats already updated inside audit_file_batch
                 err_msg = (
-                    "Rate limit hit (retries + fallbacks exhausted)"
+                    "Rate limit hit (all retries exhausted)"
                     if stats.rate_limit_hits > 0
-                    else "All retries and fallbacks exhausted"
+                    else "All retries exhausted"
                 )
                 errors.append(f"Batch {batch_idx + 1} failed ({', '.join(batch_names)}): {err_msg}")
                 yield _p(
@@ -1493,7 +1433,6 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     f"&nbsp;&nbsp;&nbsp;&nbsp;⚠ Batch {batch_idx + 1} skipped: {escape(err_msg)}"
                 )
 
-            # Inter-batch pause: be polite to free-tier rate limits
             if batch_idx < len(batches) - 1:
                 time.sleep(2.0)
 
@@ -1503,7 +1442,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         if stats.is_incomplete:
             yield _p(
                 "pline-warn",
-                f"⚠ Step 5/5: Audit incomplete due to rate limits — "
+                f"⚠ Step 5/5: Audit incomplete — "
                 f"{stats.failed_batches} batch(es) skipped. "
                 f"Violations below are from {stats.successful_batches} successful batch(es) only."
             )
@@ -1558,7 +1497,8 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
-    """Full BYOK scan using paid models."""
+    """Full BYOK scan using paid models (Perplexity + Grok + Claude).
+    Falls back to openrouter/auto:free if all paid retries are exhausted."""
     repo_url = request.form.get("repo_url", "").strip()
     pat      = request.form.get("pat", "").strip()
     api_key  = request.form.get("api_key", "").strip()
@@ -1578,11 +1518,9 @@ def scan():
 
 @app.route("/demo", methods=["POST"])
 def demo_scan():
-    """
-    Demo scan using free :free OpenRouter models.
-    User must supply their own OpenRouter key (required for rate limiting).
-    All models are $0 — user will NOT be billed.
-    """
+    """Demo scan using openrouter/auto:free for all roles.
+    OpenRouter auto-selects the best available free model per request.
+    User must supply their own OpenRouter key — $0.00 billed."""
     repo_url = request.form.get("repo_url", "").strip() or DEMO_REPO_URL
     api_key  = request.form.get("demo_api_key", "").strip()
 
@@ -1593,7 +1531,7 @@ def demo_scan():
         return (
             "<h2>OpenRouter API Key Required</h2>"
             "<p>The free demo requires your own OpenRouter key. "
-            "All models used are <code>:free</code> tier — <strong>$0.00 billed</strong>.</p>"
+            "All calls use <code>openrouter/auto:free</code> — <strong>$0.00 billed</strong>.</p>"
             "<p>Your key is needed only for rate limiting (20 req/min · 200 req/day).</p>"
             "<p><a href='https://openrouter.ai/keys' target='_blank'>Get a free key →</a></p>"
             "<p><a href='/'>← Back to scanner</a></p>",
@@ -1614,10 +1552,11 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("\n  🇦🇪 UAE Compliance Scanner — Production Build")
     print(f"  http://0.0.0.0:{port}")
-    print(f"  Demo repo  : {DEMO_REPO_URL}")
-    print(f"  Rate limit : {_rate_limiter._min_interval}s between requests (global)")
-    print(f"  Batch size : {DEMO_BATCH_SIZE} files/call (demo)  |  {BATCH_SIZE} files/call (full)")
-    print(f"  Retry      : up to 5 attempts with exponential backoff (1s→2→4→8→16)")
-    print(f"  Fallbacks  : qwen→deepseek→mistral  (demo audit chain)")
+    print(f"  Demo repo    : {DEMO_REPO_URL}")
+    print(f"  Demo models  : openrouter/auto:free (all roles — $0.00 billed)")
+    print(f"  Full fallback: openrouter/auto:free (last resort after paid model exhaustion)")
+    print(f"  Rate limit   : {_rate_limiter._min_interval}s between requests (global)")
+    print(f"  Batch size   : {DEMO_BATCH_SIZE} files/call (demo)  |  {BATCH_SIZE} files/call (full)")
+    print(f"  Retry        : up to 5 attempts with exponential backoff (1s→2→4→8→16)")
     print()
     app.run(debug=False, host="0.0.0.0", port=port)
