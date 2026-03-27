@@ -6,6 +6,11 @@ Uses OpenRouter (https://openrouter.ai/api/v1) to access Perplexity, Grok, and C
 
 Requirements:
     pip install flask requests gitpython
+
+Environment variables:
+    DEMO_OPENROUTER_KEY   — your key for demo mode (required for /demo route)
+    FLASK_SECRET_KEY      — secret key for session signing (set any random string in prod)
+    PORT                  — port to listen on (default 5000)
 """
 
 import os
@@ -26,13 +31,30 @@ except ImportError:
     gitpython = None
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
+
+# Session signing key — set FLASK_SECRET_KEY in your environment for production
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "uae-scanner-demo-change-me-in-prod")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# ── BYOK (Bring Your Own Key) — original paid models ──────────────────────────
+# ── Demo mode settings ────────────────────────────────────────────────────────
+# Set DEMO_OPENROUTER_KEY in your environment (Render dashboard → Environment).
+# Never hard-code the key in source — keep this as os.environ.get().
+DEMO_KEY = os.environ.get("DEMO_OPENROUTER_KEY", "")
+
+# Public repos offered as demo targets. Rotate if one gets too much traffic.
+DEMO_REPOS = [
+    ("https://github.com/moov-io/iso8583",          "moov-io/iso8583 — ISO 8583 payment messaging (Go)"),
+    ("https://github.com/stripe/stripe-python",     "stripe/stripe-python — Stripe Python SDK"),
+    ("https://github.com/plaid/plaid-python",       "plaid/plaid-python — Plaid open-banking SDK"),
+    ("https://github.com/fiatconnect/fiatconnect-api", "fiatconnect/fiatconnect-api — Fiat<>Crypto bridge"),
+]
+
+# Default repo used when demo form is submitted without choosing
+DEMO_DEFAULT_REPO = DEMO_REPOS[0][0]
+
 MODELS = {
     "regulations": "perplexity/sonar-deep-research",
     "enforcement": "x-ai/grok-4.20-multi-agent-beta",
@@ -45,54 +67,17 @@ MODEL_PRICING = {
     "anthropic/claude-sonnet-4-6":       {"input": 3.00,  "output": 15.00},
 }
 
-# ── Demo mode — free OpenRouter models (operator-funded, not charged to user) ──
-#
-#   Free-tier limits: 20 req/min · 200 req/day (across all :free models combined)
-#   File cap for demo: MAX_DEMO_FILES to avoid exhausting the daily quota in one run.
-#
-#   Model rationale (March 2026 OpenRouter rankings):
-#     regulations  → nvidia/nemotron-super-49b-v1:free  — 1M-token context, hybrid
-#                    Mamba-Transformer MoE, best free model for long-document legal
-#                    reasoning and cross-document synthesis.
-#     enforcement  → meta-llama/llama-3.3-70b-instruct:free  — GPT-4-class general
-#                    knowledge, fast, highly available; ideal for trend summarisation.
-#     audit        → qwen/qwen3-coder-480b-a35b:free  — top-ranked free coding model
-#                    on OpenRouter (262K context, state-of-the-art code generation).
-
-DEMO_OPENROUTER_KEY = os.environ.get("DEMO_OPENROUTER_KEY", "")   # YOUR key goes here
-DEMO_REPO_URL       = os.environ.get(                             # default public repo
-    "DEMO_REPO_URL",
-    "https://github.com/firmai/financial-machine-learning",
-)
-MAX_DEMO_FILES = 5     # keep well inside the 200 req/day free-tier budget
-
-DEMO_MODELS = {
-    # Long-context legal/doc reasoning — 1M token window
-    "regulations": "nvidia/nemotron-super-49b-v1:free",
-    # General knowledge / trend summarisation — GPT-4-class
-    "enforcement": "meta-llama/llama-3.3-70b-instruct:free",
-    # Best free code-audit model — 262K context, 480B params
-    "audit":       "qwen/qwen3-coder-480b-a35b:free",
-}
-
-# Free-tier models are $0, so cost tracking shows $0.0000 intentionally
-DEMO_MODEL_PRICING = {
-    "nvidia/nemotron-super-49b-v1:free":       {"input": 0.0, "output": 0.0},
-    "meta-llama/llama-3.3-70b-instruct:free":  {"input": 0.0, "output": 0.0},
-    "qwen/qwen3-coder-480b-a35b:free":         {"input": 0.0, "output": 0.0},
-}
-
 UAE_FRAMEWORKS = [
-    ("1", "PDPL Federal Decree-Law 45/2021",     "Personal Data Protection — consent, data minimisation, cross-border transfers, subject rights"),
-    ("2", "AML Law 20/2018",                      "Anti-Money Laundering — KYC, transaction monitoring, suspicious activity reporting, record keeping"),
-    ("3", "CBUAE Decree-Law 6/2025",              "Central Bank — payment services licensing, stored value, open banking, consumer protection"),
-    ("4", "VARA Virtual Asset Regulations 2023",  "Virtual assets — exchange, custody, issuance, wallet services, travel rule"),
-    ("5", "DIFC DPL 5/2020",                      "DIFC Data Protection Law — lawful basis, data transfers, controller obligations"),
-    ("6", "NESA IA-7",                            "National Electronic Security Authority — cybersecurity controls, encryption, access management, logging"),
-    ("7", "UAE Corporate Tax Law 47/2022",         "Corporate tax compliance in financial logic — revenue recognition, transfer pricing, reporting"),
-    ("8", "Cabinet Resolution 58/2020",           "AML/CFT — beneficial ownership registers, enhanced due diligence, cross-border wire rules"),
-    ("9", "SCA Board Decision 23/2020",           "Securities and Commodities Authority — fintech, robo-advisory, crowdfunding, investment platforms"),
-    ("10","UAE Consumer Protection Law 15/2020",  "Data handling, pricing disclosure, complaint mechanisms, unfair terms in consumer-facing code"),
+    ("1",  "PDPL Federal Decree-Law 45/2021",     "Personal Data Protection — consent, data minimisation, cross-border transfers, subject rights"),
+    ("2",  "AML Law 20/2018",                      "Anti-Money Laundering — KYC, transaction monitoring, suspicious activity reporting, record keeping"),
+    ("3",  "CBUAE Decree-Law 6/2025",              "Central Bank — payment services licensing, stored value, open banking, consumer protection"),
+    ("4",  "VARA Virtual Asset Regulations 2023",  "Virtual assets — exchange, custody, issuance, wallet services, travel rule"),
+    ("5",  "DIFC DPL 5/2020",                      "DIFC Data Protection Law — lawful basis, data transfers, controller obligations"),
+    ("6",  "NESA IA-7",                            "National Electronic Security Authority — cybersecurity controls, encryption, access management, logging"),
+    ("7",  "UAE Corporate Tax Law 47/2022",         "Corporate tax compliance in financial logic — revenue recognition, transfer pricing, reporting"),
+    ("8",  "Cabinet Resolution 58/2020",           "AML/CFT — beneficial ownership registers, enhanced due diligence, cross-border wire rules"),
+    ("9",  "SCA Board Decision 23/2020",           "Securities and Commodities Authority — fintech, robo-advisory, crowdfunding, investment platforms"),
+    ("10", "UAE Consumer Protection Law 15/2020",  "Data handling, pricing disclosure, complaint mechanisms, unfair terms in consumer-facing code"),
 ]
 
 TARGET_EXTENSIONS = {".py", ".js", ".ts", ".sol"}
@@ -105,10 +90,8 @@ MAX_FILE_CHARS = 30_000
 
 # ─── OpenRouter helper ────────────────────────────────────────────────────────
 
-def openrouter_chat(api_key, model, messages, pricing_table=None):
+def openrouter_chat(api_key, model, messages):
     """Returns (content, input_tokens, output_tokens)."""
-    if pricing_table is None:
-        pricing_table = MODEL_PRICING
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -159,14 +142,12 @@ def extract_json(text):
     return None
 
 
-def calc_cost(model, inp, out, pricing_table=None):
-    if pricing_table is None:
-        pricing_table = MODEL_PRICING
-    p = pricing_table.get(model, {"input": 3.0, "output": 15.0})
+def calc_cost(model, inp, out):
+    p = MODEL_PRICING.get(model, {"input": 3.0, "output": 15.0})
     return (inp * p["input"] + out * p["output"]) / 1_000_000
 
 
-def find_source_files(repo_dir, limit=MAX_FILES):
+def find_source_files(repo_dir):
     results = []
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -175,7 +156,7 @@ def find_source_files(repo_dir, limit=MAX_FILES):
                 full = os.path.join(root, fname)
                 rel  = os.path.relpath(full, repo_dir)
                 results.append((full, rel))
-    return results[:limit]
+    return results[:MAX_FILES]
 
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
@@ -190,6 +171,67 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 .site-header{display:flex;align-items:center;gap:14px;margin-bottom:6px}
 .site-header h1{color:#58a6ff;font-size:1.9rem;letter-spacing:-.5px}
 .tagline{color:#8b949e;font-size:.92rem;margin-bottom:28px}
+
+/* ── Demo banner ── */
+.demo-banner{
+    background:linear-gradient(90deg,#1a2340,#0f1a30);
+    border:1px solid #58a6ff66;
+    border-left:4px solid #58a6ff;
+    border-radius:8px;
+    padding:14px 18px;
+    margin-bottom:22px;
+    display:flex;
+    align-items:flex-start;
+    gap:12px;
+}
+.demo-banner-icon{font-size:1.4rem;line-height:1;flex-shrink:0;margin-top:1px}
+.demo-banner-body{flex:1}
+.demo-banner-title{color:#58a6ff;font-weight:700;font-size:.95rem;margin-bottom:4px}
+.demo-banner-text{color:#8b949e;font-size:.82rem;line-height:1.5}
+.demo-banner-text strong{color:#c9d1d9}
+
+/* ── Demo entry card on landing ── */
+.demo-card{
+    background:#0d1117;
+    border:1px solid #58a6ff40;
+    border-radius:10px;
+    padding:22px 28px;
+    margin-bottom:14px;
+}
+.demo-card h3{color:#58a6ff;font-size:1rem;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.demo-card p{color:#8b949e;font-size:.85rem;margin-bottom:14px;line-height:1.5}
+.btn-demo{
+    background:linear-gradient(135deg,#1a3a6b,#1d4ed8);
+    color:#e8f0fe;border:1px solid #3b82f680;
+    padding:11px 22px;border-radius:7px;
+    font-size:.95rem;font-weight:700;cursor:pointer;
+    letter-spacing:.3px;transition:opacity .15s;
+    text-decoration:none;display:inline-block;
+}
+.btn-demo:hover{opacity:.88}
+
+/* ── Or divider ── */
+.or-divider{
+    display:flex;align-items:center;gap:12px;
+    margin:18px 0;color:#484f58;font-size:.82rem;
+}
+.or-divider::before,.or-divider::after{
+    content:'';flex:1;height:1px;background:#21262d;
+}
+
+/* ── Demo repo picker ── */
+.repo-picker{margin-bottom:16px}
+.repo-option{
+    display:flex;align-items:center;gap:10px;
+    background:#0d1117;border:1px solid #30363d;
+    border-radius:7px;padding:10px 14px;margin-bottom:7px;
+    cursor:pointer;transition:border-color .15s;
+}
+.repo-option:hover{border-color:#58a6ff}
+.repo-option input[type=radio]{accent-color:#58a6ff;flex-shrink:0}
+.repo-option-label{font-size:.87rem;color:#c9d1d9}
+.repo-option-desc{font-size:.75rem;color:#8b949e;margin-top:1px}
+.repo-option input[type=radio]:checked ~ .repo-option-label{color:#58a6ff}
 
 /* ── Form card ── */
 .form-card{background:#161b22;border:1px solid #30363d;border-radius:10px;
@@ -213,49 +255,6 @@ input:focus{outline:none;border-color:#58a6ff;
           transition:opacity .15s;margin-top:4px}
 .btn-scan:hover{opacity:.88}
 .btn-scan:disabled{background:#21262d;color:#484f58;cursor:not-allowed;opacity:1}
-
-/* ── Demo button ── */
-.btn-demo{background:linear-gradient(135deg,#1a3a5c,#1f4e79);color:#58a6ff;
-          border:2px solid #58a6ff55;padding:13px 24px;border-radius:7px;
-          font-size:1rem;font-weight:700;cursor:pointer;width:100%;letter-spacing:.3px;
-          transition:all .15s;margin-top:0}
-.btn-demo:hover{background:linear-gradient(135deg,#1f4e79,#2563a8);
-                border-color:#58a6ff99;opacity:1}
-.btn-demo:disabled{background:#21262d;color:#484f58;cursor:not-allowed;
-                   border-color:#30363d}
-
-/* ── Demo card ── */
-.demo-card{background:#0d1520;border:2px solid #58a6ff40;border-radius:10px;
-           padding:28px;margin-bottom:20px;position:relative;overflow:hidden}
-.demo-card::before{content:'DEMO';position:absolute;top:12px;right:14px;
-                   color:#58a6ff;font-size:.68rem;font-weight:700;letter-spacing:1.5px;
-                   background:#58a6ff18;border:1px solid #58a6ff40;border-radius:12px;
-                   padding:2px 10px}
-.demo-card h2{color:#58a6ff;font-size:1.05rem;margin-bottom:8px;
-              border-bottom:1px solid #1a3a5c;padding-bottom:10px}
-.demo-badge-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
-.demo-badge{background:#58a6ff12;border:1px solid #58a6ff40;border-radius:16px;
-            padding:4px 12px;font-size:.74rem;color:#58a6ff}
-.demo-warning{background:#d2992215;border:1px solid #d2992240;border-radius:7px;
-              padding:10px 14px;margin-bottom:16px;font-size:.82rem;color:#d29922}
-.demo-repo-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.demo-repo-label{color:#8b949e;font-size:.8rem;white-space:nowrap}
-.demo-repo-url{color:#58a6ff;font-family:monospace;font-size:.8rem;
-               word-break:break-all;text-decoration:none}
-.demo-repo-url:hover{text-decoration:underline}
-
-/* ── Demo scan banner ── */
-.demo-scan-banner{background:#0d1520;border:2px solid #58a6ff40;border-radius:8px;
-                  padding:12px 18px;margin-bottom:16px;display:flex;
-                  align-items:center;gap:10px;font-size:.85rem}
-.demo-scan-banner strong{color:#58a6ff}
-
-/* ── Model pill ── */
-.model-pill{display:inline-block;background:#161b22;border:1px solid #30363d;
-            border-radius:6px;padding:2px 8px;font-family:monospace;font-size:.72rem;
-            color:#8b949e;margin-left:4px}
-.model-pill-free{border-color:#3fb95060;color:#3fb950;background:#3fb95010}
-
 .note{text-align:center;color:#484f58;font-size:.78rem;margin-top:10px}
 
 /* ── Framework badges ── */
@@ -263,14 +262,6 @@ input:focus{outline:none;border-color:#58a6ff;
 .fw-pill{background:#161b22;border:1px solid #30363d;border-radius:20px;
          padding:5px 12px;font-size:.75rem;color:#8b949e;cursor:default}
 .fw-pill:hover{border-color:#58a6ff;color:#58a6ff}
-
-/* ── Divider ── */
-.or-divider{text-align:center;color:#484f58;font-size:.82rem;margin:6px 0 16px;
-            position:relative}
-.or-divider::before,.or-divider::after{content:'';position:absolute;top:50%;
-    width:40%;height:1px;background:#21262d}
-.or-divider::before{left:0}
-.or-divider::after{right:0}
 
 /* ── Progress ── */
 .progress-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;
@@ -281,7 +272,6 @@ input:focus{outline:none;border-color:#58a6ff;
 .pline-err{color:#f85149}
 .pline-work{color:#58a6ff}
 .pline-info{color:#d29922}
-.pline-demo{color:#58a6ff;font-style:italic}
 
 /* ── Section heading ── */
 h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
@@ -365,6 +355,15 @@ h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
 .err-box{background:#f8514912;border:1px solid #f8514960;border-radius:7px;
          padding:10px 14px;margin:6px 0;color:#f85149;font-size:.87rem}
 
+/* ── Rate-limit box ── */
+.ratelimit-box{
+    background:#1a0e0e;border:2px solid #f8514980;border-radius:10px;
+    padding:28px;text-align:center;margin:24px 0;
+}
+.ratelimit-box h2{color:#f85149;margin-bottom:10px}
+.ratelimit-box p{color:#8b949e;font-size:.9rem;margin-bottom:16px}
+.ratelimit-box a{color:#58a6ff;text-decoration:none;font-weight:700}
+
 /* ── Footer ── */
 .site-footer{text-align:center;color:#8b949e;font-size:.85rem;margin-top:48px;
              padding:24px 0;border-top:1px solid #21262d}
@@ -384,101 +383,64 @@ h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
 }
 """
 
-# ─── Landing page ─────────────────────────────────────────────────────────────
+# ─── Shared HTML fragments ────────────────────────────────────────────────────
 
 FRAMEWORKS_HTML = "".join(
     f'<span class="fw-pill" title="{escape(desc)}">#{n} {escape(name)}</span>'
     for n, name, desc in UAE_FRAMEWORKS
 )
 
-def _operator_demo_available():
-    """True if the operator has pre-loaded a demo key in the environment."""
-    return bool(DEMO_OPENROUTER_KEY)
+FOOTER_HTML = """
+<div class="site-footer">
+  <p>Scanned against 10 UAE regulatory frameworks + live Grok enforcement trends + Perplexity regulatory updates.</p>
+  <div class="contact-box">
+    <p>Found violations in your codebase? Need remediation?</p>
+    <a href="mailto:virgil3692@proton.me">📩 virgil3692@proton.me</a>
+  </div>
+  <p style="margin-top:14px;font-size:.75rem">
+    UAE Compliance Scanner &nbsp;·&nbsp; Powered by OpenRouter &nbsp;·&nbsp;
+    Your credentials are never stored.
+  </p>
+</div>
+"""
+
+# ─── Landing page ─────────────────────────────────────────────────────────────
+
+def _demo_repo_options_html():
+    """Render the radio-button repo picker for the demo form."""
+    items = []
+    for i, (url, label) in enumerate(DEMO_REPOS):
+        checked = "checked" if i == 0 else ""
+        short, desc = label.split(" — ", 1)
+        items.append(
+            f'<label class="repo-option">'
+            f'<input type="radio" name="repo_url" value="{escape(url)}" {checked}>'
+            f'<span>'
+            f'<span class="repo-option-label">{escape(short)}</span><br>'
+            f'<span class="repo-option-desc">{escape(desc)}</span>'
+            f'</span>'
+            f'</label>'
+        )
+    return "\n".join(items)
 
 
 def index_html():
-    # Always show the demo card.
-    # Key resolution order (handled in /demo route):
-    #   1. User's own OpenRouter key (typed into the demo form)
-    #   2. Operator's DEMO_OPENROUTER_KEY env var (if set)
-    #   3. Neither → show error
+    demo_available = bool(DEMO_KEY)
+    demo_section = ""
 
-    operator_note = (
-        "Leave blank to use the shared demo key — or paste your own key below "
-        "to run free models <strong>on your own quota</strong>."
-        if _operator_demo_available()
-        else
-        "Free models require an OpenRouter key. "
-        "<a href='https://openrouter.io/keys' target='_blank'>Get one free →</a> "
-        "and paste it below — you won't be charged for <code>:free</code> models."
-    )
-
-    demo_section = f"""
+    if demo_available:
+        demo_section = f"""
 <div class="demo-card">
-  <h2>⚡ Free-Model Demo — Runs on Open-Source AI</h2>
-
-  <div class="demo-badge-row">
-    <span class="demo-badge">🆓 Free-tier models ($0 cost)</span>
-    <span class="demo-badge">🔒 Public repos only</span>
-    <span class="demo-badge">📄 First {MAX_DEMO_FILES} files scanned</span>
-    <span class="demo-badge">🤖 Your quota or ours</span>
-  </div>
-
-  <div class="demo-warning">
-    ⚠ <strong>How billing works:</strong>
-    All three models used here carry a <code>:free</code> suffix on OpenRouter — they cost
-    <strong>$0.00</strong> regardless of whose key is used.
-    Your key is only needed so OpenRouter can track rate limits (20 req/min · 200 req/day per key).
-    <strong>No charges will appear on your account.</strong>
-  </div>
-
-  <div class="demo-repo-row">
-    <span class="demo-repo-label">Default repo:</span>
-    <a href="{escape(DEMO_REPO_URL)}" class="demo-repo-url"
-       target="_blank" rel="noopener">{escape(DEMO_REPO_URL)}</a>
-  </div>
-  <p class="hint" style="margin-bottom:14px">
-    Scans a public fintech sample repo. Override below for any public GitHub URL.
+  <h3>⚡ Try a Live Demo</h3>
+  <p>
+    No API key needed. Choose a real public fintech repo below and see the scanner
+    run against <strong>10 UAE frameworks + live enforcement data</strong>.
+    Limited to one scan per session.
   </p>
-
-  <form method="POST" action="/demo" id="df">
-
-    <label for="demo_repo_url">Public GitHub Repo URL
-      <span style="color:#484f58;font-weight:400;text-transform:none">
-        (optional — defaults to sample repo above)</span>
-    </label>
-    <input type="url" id="demo_repo_url" name="repo_url"
-           placeholder="{escape(DEMO_REPO_URL)}">
-    <p class="hint">Must be a <strong>public</strong> repository. No PAT required.</p>
-
-    <label for="demo_api_key">OpenRouter API Key
-      <span style="color:#484f58;font-weight:400;text-transform:none">(optional)</span>
-    </label>
-    <input type="password" id="demo_api_key" name="demo_api_key"
-           placeholder="sk-or-v1-xxxxxxxxxxxxxxxxxxxx — leave blank to use shared demo key"
-           autocomplete="off">
-    <p class="hint">{operator_note}</p>
-
-    <div style="background:#0d1117;border:1px solid #30363d;border-radius:7px;
-                padding:10px 14px;margin-bottom:16px;font-size:.78rem;color:#8b949e">
-      <strong style="color:#c9d1d9">Models used (all :free — $0 billed):</strong><br>
-      <span style="color:#8b949e">Regulations:</span>
-      <span class="model-pill model-pill-free">nvidia/nemotron-super-49b-v1:free</span>
-      &nbsp;
-      <span style="color:#8b949e">Enforcement:</span>
-      <span class="model-pill model-pill-free">meta-llama/llama-3.3-70b-instruct:free</span>
-      &nbsp;
-      <span style="color:#8b949e">Code audit:</span>
-      <span class="model-pill model-pill-free">qwen/qwen3-coder-480b-a35b:free</span>
-    </div>
-
-    <button type="submit" class="btn-demo" id="dbtn">
-      ⚡ Run Free Demo Scan
-    </button>
-  </form>
+  <a href="/demo" class="btn-demo">⚡ Open Demo Scanner →</a>
 </div>
 
-<div class="or-divider">— or bring your own key for a full scan —</div>
+<div class="or-divider">or bring your own key</div>
 """
 
     return f"""<!DOCTYPE html>
@@ -512,7 +474,7 @@ def index_html():
 {demo_section}
 
 <div class="form-card">
-  <h2>🔍 Full Scan — Bring Your Own Key</h2>
+  <h2>🔍 Start a Compliance Scan <span style="font-size:.8rem;color:#484f58;font-weight:400;text-transform:none">(BYOK — bring your own key)</span></h2>
   <form method="POST" action="/scan" id="sf">
 
     <label for="repo_url">GitHub Repository URL</label>
@@ -536,7 +498,7 @@ def index_html():
       <a href="https://openrouter.io/keys" target="_blank">Get your key →</a>
     </p>
 
-    <button type="submit" class="btn-scan" id="btn">🔍 Start Full Compliance Scan</button>
+    <button type="submit" class="btn-scan" id="btn">🔍 Start Compliance Scan</button>
   </form>
 </div>
 
@@ -548,13 +510,120 @@ document.getElementById('sf').addEventListener('submit', function() {{
   b.disabled = true;
   b.textContent = '⏳ Scanning — this may take several minutes…';
 }});
-document.getElementById('df').addEventListener('submit', function() {{
+</script>
+
+</div>
+</body>
+</html>"""
+
+
+# ─── Demo landing page ────────────────────────────────────────────────────────
+
+def demo_index_html(error=None):
+    """Render the demo-mode scan form."""
+    error_html = ""
+    if error:
+        error_html = f'<div class="err-box" style="margin-bottom:16px">{escape(error)}</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo — UAE Compliance Scanner</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="container">
+
+<div class="site-header">
+  <span style="font-size:2.2rem">🇦🇪</span>
+  <h1>UAE Compliance Scanner</h1>
+</div>
+
+<div class="demo-banner">
+  <div class="demo-banner-icon">⚡</div>
+  <div class="demo-banner-body">
+    <div class="demo-banner-title">Demo Mode — Shared Key</div>
+    <div class="demo-banner-text">
+      This scan uses a <strong>shared API key</strong> and is limited to
+      <strong>public GitHub repos</strong> only. One free scan per session.
+      For unlimited scans on private repos, use the
+      <a href="/" style="color:#58a6ff">BYOK mode</a> on the main page.
+    </div>
+  </div>
+</div>
+
+{error_html}
+
+<div class="form-card">
+  <h2>⚡ Demo Scan — Choose a Repo</h2>
+  <form method="POST" action="/demo" id="dsf">
+
+    <label style="margin-bottom:10px">Select a public repo to scan</label>
+    <div class="repo-picker">
+      {_demo_repo_options_html()}
+    </div>
+    <p class="hint" style="margin-bottom:20px">
+      All repos are well-known open-source fintech projects — none contain real customer data.
+    </p>
+
+    <button type="submit" class="btn-scan" id="dbtn">⚡ Run Demo Scan</button>
+  </form>
+</div>
+
+<p class="note">🔒 No credentials required. The shared key is rate-limited and never exposed to your browser.</p>
+
+<script>
+document.getElementById('dsf').addEventListener('submit', function() {{
   var b = document.getElementById('dbtn');
   b.disabled = true;
-  b.textContent = '⏳ Running demo scan — please wait…';
+  b.textContent = '⏳ Scanning — this may take several minutes…';
 }});
 </script>
 
+</div>
+</body>
+</html>"""
+
+
+def demo_ratelimit_html():
+    """Shown when the session has already consumed its one demo scan."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo limit reached — UAE Compliance Scanner</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="container">
+<div class="site-header">
+  <span style="font-size:2.2rem">🇦🇪</span>
+  <h1>UAE Compliance Scanner</h1>
+</div>
+<div class="demo-banner">
+  <div class="demo-banner-icon">⚡</div>
+  <div class="demo-banner-body">
+    <div class="demo-banner-title">Demo Mode — Shared Key</div>
+    <div class="demo-banner-text">Limited to one free scan per session.</div>
+  </div>
+</div>
+<div class="ratelimit-box">
+  <h2>⏱ Demo limit reached</h2>
+  <p>
+    You've already used your free demo scan this session.<br>
+    To run unlimited scans — including on private repos — bring your own
+    OpenRouter key on the main page.
+  </p>
+  <p style="margin-top:12px">
+    <a href="/">← Back to main scanner (BYOK)</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://openrouter.io/keys" target="_blank">Get a free OpenRouter key →</a>
+  </p>
+</div>
+{FOOTER_HTML}
 </div>
 </body>
 </html>"""
@@ -586,33 +655,22 @@ def _card_cls(severity):
 
 def render_report(violations, enforcements, regulations,
                   total_in, total_out, total_cost, cost_by_model,
-                  num_files, errors, is_demo=False, key_source="operator"):
-    # key_source: "operator" = shared demo key (truly free for user)
-    #             "user"     = user's own key, but :free models so $0 billed
+                  num_files, errors, is_demo=False):
+
     h = []
 
-    # ── Demo notice banner ────────────────────────────────────────────────────
+    # ── Demo banner inside results page ───────────────────────────────────────
     if is_demo:
-        if key_source == "user":
-            key_note = (
-                "Running on <strong>your OpenRouter key</strong> with free-tier models — "
-                "<strong>$0.00 billed to your account.</strong>"
-            )
-        else:
-            key_note = (
-                "Running on the <strong>shared demo key</strong> — "
-                "<strong>completely free for you.</strong>"
-            )
-        h.append(f"""
-<div class="demo-scan-banner">
-  <span style="font-size:1.4rem">⚡</span>
-  <div>
-    <strong>Demo Scan</strong> — powered by free open-source models
-    (nvidia/nemotron-super · llama-3.3-70b · qwen3-coder-480b).<br>
-    {key_note}<br>
-    <span style="color:#8b949e">Only the first {MAX_DEMO_FILES} files were audited.
-    Run a <a href="/" style="color:#58a6ff">full BYOK scan</a> for complete coverage
-    with Perplexity + Grok + Claude.</span>
+        h.append("""
+<div class="demo-banner">
+  <div class="demo-banner-icon">⚡</div>
+  <div class="demo-banner-body">
+    <div class="demo-banner-title">Demo Mode — Results</div>
+    <div class="demo-banner-text">
+      These results were generated using a <strong>shared key</strong> on a public repo.
+      For scans of your own private repositories,
+      <a href="/" style="color:#58a6ff">use the BYOK scanner</a>.
+    </div>
   </div>
 </div>
 """)
@@ -664,11 +722,8 @@ def render_report(violations, enforcements, regulations,
                  '✅ No violations detected across all 10 UAE regulatory frameworks + trending updates.</div>')
 
     # ── Enforcement actions ────────────────────────────────────────────────────
-    enf_label = ("(via Llama 3.3 70B — demo)"
-                 if is_demo else "(via Grok — trending)")
-    h.append(f'<h2 class="section">⚖ Recent UAE Enforcement Actions '
-             f'<span style="font-size:.75rem;color:#8b949e;font-weight:400">'
-             f'{enf_label}</span></h2>')
+    h.append('<h2 class="section">⚖ Recent UAE Enforcement Actions '
+             '<span style="font-size:.75rem;color:#8b949e;font-weight:400">(via Grok — trending)</span></h2>')
     if enforcements:
         for e in enforcements:
             try:
@@ -706,11 +761,8 @@ def render_report(violations, enforcements, regulations,
         h.append('<div class="card">No enforcement data retrieved.</div>')
 
     # ── Regulatory updates ─────────────────────────────────────────────────────
-    reg_label = ("(via Nemotron 3 Super — demo)"
-                 if is_demo else "(via Perplexity)")
-    h.append(f'<h2 class="section">📜 New UAE Regulatory Updates '
-             f'<span style="font-size:.75rem;color:#8b949e;font-weight:400">'
-             f'{reg_label}</span></h2>')
+    h.append('<h2 class="section">📜 New UAE Regulatory Updates '
+             '<span style="font-size:.75rem;color:#8b949e;font-weight:400">(via Perplexity)</span></h2>')
     if regulations:
         for r in regulations:
             h.append('<div class="card card-reg">')
@@ -742,32 +794,16 @@ def render_report(violations, enforcements, regulations,
     lowest_fine  = min(fines) if fines else 0
     highest_fine = max(fines) if fines else 0
 
-    roi_pct   = ((lowest_fine - total_cost) / total_cost * 100) if total_cost > 0 and lowest_fine > 0 else 0
+    roi_pct    = ((lowest_fine - total_cost) / total_cost * 100) if total_cost > 0 and lowest_fine > 0 else 0
     per_dollar = (lowest_fine / total_cost) if total_cost > 0 and lowest_fine > 0 else 0
 
     h.append('<div class="roi-wrap">')
     h.append('<div class="roi-title">📈 Scan Cost vs. Regulatory Risk</div>')
 
     h.append('<div class="roi-grid">')
-
-    scan_cost_val = (
-        '<div class="roi-cell-val roi-green">$0.0000</div>'
-        if is_demo else
-        f'<div class="roi-cell-val roi-green">${total_cost:.4f}</div>'
-    )
-    if is_demo and key_source == "user":
-        cost_label = "Scan Cost (Your Key)"
-        cost_sub   = "Free-tier models — $0 billed to your account."
-    elif is_demo:
-        cost_label = "Scan Cost (Operator-Funded)"
-        cost_sub   = "Completely free — shared demo key used."
-    else:
-        cost_label = "Scan Cost (You Paid)"
-        cost_sub   = None
-
+    cost_label = "Scan Cost (Shared Key)" if is_demo else "Scan Cost (You Paid)"
     h.append(f'<div class="roi-cell"><div class="roi-cell-label">{cost_label}</div>'
-             f'{scan_cost_val}</div>')
-
+             f'<div class="roi-cell-val roi-green">${total_cost:.4f}</div></div>')
     if lowest_fine > 0:
         h.append(f'<div class="roi-cell"><div class="roi-cell-label">Lowest Recent Fine</div>'
                  f'<div class="roi-cell-val roi-red">${lowest_fine:,.0f}</div></div>')
@@ -777,19 +813,7 @@ def render_report(violations, enforcements, regulations,
              f'<div class="roi-cell-val roi-blue">{total_in+total_out:,}</div></div>')
     h.append('</div>')  # roi-grid
 
-    if is_demo and violations:
-        h.append('<div class="roi-big" style="color:#3fb950">$0.00 ✓</div>')
-        if key_source == "user":
-            h.append('<div class="roi-sub">Free-tier models ran on <strong>your key</strong> — '
-                     '$0.00 billed to your OpenRouter account. '
-                     'Run a <a href="/" style="color:#58a6ff">full BYOK scan</a> '
-                     'for complete coverage with Perplexity + Grok + Claude.</div>')
-        else:
-            h.append('<div class="roi-sub">Shared demo key was used — '
-                     'this scan cost you absolutely nothing. '
-                     'Run a <a href="/" style="color:#58a6ff">full BYOK scan</a> '
-                     'for complete coverage with Perplexity + Grok + Claude.</div>')
-    elif lowest_fine > 0 and violations:
+    if lowest_fine > 0 and violations:
         h.append(f'<div class="roi-big">{roi_pct:,.0f}% ROI</div>')
         h.append(f'<div class="roi-sub">For every <strong>$1</strong> spent on this scan, '
                  f'you could avoid up to <strong>${per_dollar:,.0f}</strong> in regulatory fines.</div>')
@@ -799,7 +823,6 @@ def render_report(violations, enforcements, regulations,
     else:
         h.append('<div class="roi-sub">No fine data available for ROI calculation.</div>')
 
-    # Token / cost table
     h.append('<div style="margin-top:20px;overflow-x:auto">')
     h.append('<table class="token-table">')
     h.append('<tr><th>Model</th><th>Input Tokens</th><th>Output Tokens</th>'
@@ -808,15 +831,12 @@ def render_report(violations, enforcements, regulations,
     for model, d in cost_by_model.items():
         mi, mo, mc = d["input"], d["output"], d["cost"]
         t_in += mi; t_out += mo; t_cost += mc
-        free_tag = ' <span class="model-pill model-pill-free">free</span>' if is_demo else ""
-        h.append(f'<tr><td>{escape(model)}{free_tag}</td><td>{mi:,}</td><td>{mo:,}</td>'
-                 f'<td>{mi+mo:,}</td>'
-                 f'<td>{"$0.0000 ✓" if is_demo else f"${mc:.4f}"}</td></tr>')
+        h.append(f'<tr><td>{escape(model)}</td><td>{mi:,}</td><td>{mo:,}</td>'
+                 f'<td>{mi+mo:,}</td><td>${mc:.4f}</td></tr>')
     h.append(f'<tr><td>TOTAL</td><td>{t_in:,}</td><td>{t_out:,}</td>'
-             f'<td>{t_in+t_out:,}</td>'
-             f'<td>{"$0.0000 ✓" if is_demo else f"${t_cost:.4f}"}</td></tr>')
+             f'<td>{t_in+t_out:,}</td><td>${t_cost:.4f}</td></tr>')
     h.append('</table>')
-    h.append('</div>')
+    h.append('</div>')  # overflow wrapper
     h.append('</div>')  # roi-wrap
 
     # ── Errors ─────────────────────────────────────────────────────────────────
@@ -825,48 +845,41 @@ def render_report(violations, enforcements, regulations,
         for err in errors:
             h.append(f'<div class="err-box">{escape(str(err)[:500])}</div>')
 
-    # ── Footer ─────────────────────────────────────────────────────────────────
-    h.append("""
-<div class="site-footer">
-  <p>Scanned against 10 UAE regulatory frameworks + live enforcement trends + regulatory updates.</p>
-  <div class="contact-box">
-    <p>Found violations in your codebase? Need remediation?</p>
-    <a href="mailto:virgil3692@proton.me">📩 virgil3692@proton.me</a>
-  </div>
-  <p style="margin-top:14px;font-size:.75rem">
-    UAE Compliance Scanner &nbsp;·&nbsp; Powered by OpenRouter &nbsp;·&nbsp;
-    Your credentials are never stored.
-  </p>
-</div>
-""")
-
+    h.append(FOOTER_HTML)
     return "\n".join(h)
 
 
-# ─── Streaming scan pipeline ──────────────────────────────────────────────────
+# ─── Core streaming scan pipeline ────────────────────────────────────────────
 
-def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
+def stream_scan(repo_url, pat, api_key, is_demo=False):
     """
-    Core scan generator.
-
-    is_demo=False  → full BYOK scan (paid models, user's own key)
-    is_demo=True   → demo scan (free :free models, file cap)
-      key_source="operator"  → operator's DEMO_OPENROUTER_KEY, truly free for user
-      key_source="user"      → user's own key, but :free models so $0 billed
+    Shared pipeline for both BYOK (/scan) and demo (/demo) modes.
+    is_demo=True adds the demo banner and hides the user's cost.
     """
-    models       = DEMO_MODELS        if is_demo else MODELS
-    pricing      = DEMO_MODEL_PRICING  if is_demo else MODEL_PRICING
-    file_limit   = MAX_DEMO_FILES      if is_demo else MAX_FILES
+    page_title = "Demo Scan…" if is_demo else "Scanning…"
 
-    page_title   = "Demo Scan… — UAE Compliance Scanner" if is_demo else "Scanning… — UAE Compliance Scanner"
-    scan_label   = "Demo scan in progress…"               if is_demo else "Scan in progress…"
+    # ── Demo banner at the top of the progress page ───────────────────────────
+    demo_banner_html = ""
+    if is_demo:
+        demo_banner_html = """
+<div class="demo-banner">
+  <div class="demo-banner-icon">⚡</div>
+  <div class="demo-banner-body">
+    <div class="demo-banner-title">Demo Mode — Shared Key</div>
+    <div class="demo-banner-text">
+      Scanning with a shared API key. Limited to public repos.
+      <a href="/" style="color:#58a6ff">BYOK mode</a> for private repos and unlimited scans.
+    </div>
+  </div>
+</div>
+"""
 
     yield f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{page_title}</title>
+<title>{page_title} — UAE Compliance Scanner</title>
 <style>{CSS}</style>
 </head>
 <body>
@@ -876,25 +889,10 @@ def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
   <span style="font-size:2.2rem">🇦🇪</span>
   <h1>UAE Compliance Scanner</h1>
 </div>
-<p class="tagline">{scan_label}</p>
+{demo_banner_html}
+<p class="tagline">Scan in progress…</p>
+<div class="progress-box" id="pb">
 """
-
-    # Demo banner in the progress page
-    if is_demo:
-        if key_source == "user":
-            key_note = "your key · free models · <strong>$0 billed to you</strong>"
-        else:
-            key_note = "shared demo key · <strong>completely free for you</strong>"
-        yield f"""<div class="demo-scan-banner">
-  <span style="font-size:1.3rem">⚡</span>
-  <div>
-    <strong>Demo Mode</strong> — free open-source models ·
-    first {MAX_DEMO_FILES} files only · {key_note}
-  </div>
-</div>
-"""
-
-    yield '<div class="progress-box" id="pb">\n'
 
     clone_dir      = None
     total_in       = 0
@@ -914,62 +912,47 @@ def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
 
     try:
         # ── Step 1: Clone ──────────────────────────────────────────────────────
-        step_label = "Step 1/5" if not is_demo else "Demo Step 1/5"
-        yield _p("pline-work", f"⏳ {step_label}: Cloning repository…")
+        yield _p("pline-work", "⏳ Step 1/5: Cloning repository…")
         if gitpython is None:
             raise RuntimeError("GitPython not installed. Run: pip install gitpython")
 
         clone_dir = tempfile.mkdtemp(prefix="uae_scan_")
-
-        # Demo mode: never inject a PAT even if one was somehow passed
-        if is_demo:
-            auth_url = repo_url  # must be a public repo
-        else:
-            auth_url = (repo_url.replace("https://", f"https://x-access-token:{pat}@")
-                        if pat else repo_url)
-
+        auth_url  = (repo_url.replace("https://", f"https://x-access-token:{pat}@")
+                     if pat else repo_url)
         try:
             gitpython.Repo.clone_from(auth_url, clone_dir, depth=1)
         except Exception as exc:
             raise RuntimeError(f"Clone failed: {exc}")
 
-        files     = find_source_files(clone_dir, limit=file_limit)
+        files     = find_source_files(clone_dir)
         num_files = len(files)
-        cap_note  = f" (demo cap: {file_limit})" if is_demo and num_files >= file_limit else (
-                    " (capped at 50)" if num_files >= MAX_FILES else "")
+        cap_note  = " (capped at 50)" if num_files >= MAX_FILES else ""
         yield _p("pline-ok", f"✅ Cloned. {num_files} scannable file(s) found{cap_note}.")
 
         if num_files == 0:
             yield _p("pline-err", "⚠ No .py / .js / .ts / .sol files found.")
 
-        # ── Step 2: Regulatory updates ─────────────────────────────────────────
-        reg_model_label = models["regulations"]
-        yield _p("pline-work",
-                 f"⏳ Step 2/5: Fetching UAE regulatory updates "
-                 f'<span class="model-pill model-pill-free">{escape(reg_model_label)}</span>…')
+        # ── Step 2: Perplexity — new regulations ───────────────────────────────
+        yield _p("pline-work", "⏳ Step 2/5: Fetching new UAE regulatory updates (Perplexity Sonar Deep Research)…")
         try:
-            content, inp, out = openrouter_chat(
-                api_key, models["regulations"],
-                [
-                    {"role": "system",
-                     "content": "You are a UAE financial regulation researcher. Return ONLY valid JSON."},
-                    {"role": "user",
-                     "content": (
-                         "List the 5 most recent UAE regulatory updates relevant to fintech, crypto, "
-                         "and banking software. Cover VARA, ADGM, CBUAE, PDPL (Federal Decree-Law 45/2021), "
-                         "AML, NESA, SCA, DIFC, and Consumer Protection regulations. "
-                         "Return a JSON array where each object has exactly these keys: "
-                         '"regulation", "authority", "date", "summary", "impact_on_code". '
-                         "Return ONLY the JSON array, no markdown, no preamble."
-                     )},
-                ],
-                pricing_table=pricing,
-            )
+            content, inp, out = openrouter_chat(api_key, MODELS["regulations"], [
+                {"role": "system",
+                 "content": "You are a UAE financial regulation researcher. Return ONLY valid JSON."},
+                {"role": "user",
+                 "content": (
+                     "List the 5 most recent UAE regulatory updates relevant to fintech, crypto, "
+                     "and banking software. Cover VARA, ADGM, CBUAE, PDPL (Federal Decree-Law 45/2021), "
+                     "AML, NESA, SCA, DIFC, and Consumer Protection regulations. "
+                     "Return a JSON array where each object has exactly these keys: "
+                     '"regulation", "authority", "date", "summary", "impact_on_code". '
+                     "Return ONLY the JSON array, no markdown, no preamble."
+                 )},
+            ])
             total_in  += inp
             total_out += out
-            mc         = calc_cost(models["regulations"], inp, out, pricing_table=pricing)
+            mc         = calc_cost(MODELS["regulations"], inp, out)
             total_cost += mc
-            cost_by_model[models["regulations"]] = {"input": inp, "output": out, "cost": mc}
+            cost_by_model[MODELS["regulations"]] = {"input": inp, "output": out, "cost": mc}
 
             parsed = extract_json(content)
             if isinstance(parsed, list):
@@ -980,41 +963,34 @@ def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
                         regulations = v
                         break
             if not regulations:
-                errors.append(f"{reg_model_label} returned unexpected format — no regulation list parsed.")
+                errors.append("Perplexity returned unexpected format — no regulation list parsed.")
             yield _p("pline-ok", f"✅ {len(regulations)} new regulatory update(s) fetched.")
         except Exception as exc:
-            errors.append(f"Regulations model error: {exc}")
-            yield _p("pline-err", f"⚠ Regulations model failed: {escape(str(exc)[:300])}")
+            errors.append(f"Perplexity error: {exc}")
+            yield _p("pline-err", f"⚠ Perplexity failed: {escape(str(exc)[:300])}")
 
-        # ── Step 3: Enforcement actions ────────────────────────────────────────
-        enf_model_label = models["enforcement"]
-        yield _p("pline-work",
-                 f"⏳ Step 3/5: Fetching UAE enforcement actions "
-                 f'<span class="model-pill model-pill-free">{escape(enf_model_label)}</span>…')
+        # ── Step 3: Grok — trending enforcement ───────────────────────────────
+        yield _p("pline-work", "⏳ Step 3/5: Fetching trending UAE enforcement actions (Grok 4 Multi-Agent)…")
         try:
-            content, inp, out = openrouter_chat(
-                api_key, models["enforcement"],
-                [
-                    {"role": "system",
-                     "content": "You are a UAE enforcement action researcher. Return ONLY valid JSON."},
-                    {"role": "user",
-                     "content": (
-                         "List the 3 most recent real UAE enforcement actions against companies for "
-                         "financial, fintech, crypto, or data protection violations. "
-                         "Include actions by VARA, ADGM, CBUAE, DIFC, NESA, or SCA. "
-                         "Return a JSON array where each object has exactly these keys: "
-                         '"company", "fine_amount_usd" (number only), "violation", '
-                         '"authority", "date", "details". '
-                         "Return ONLY the JSON array, no markdown, no preamble."
-                     )},
-                ],
-                pricing_table=pricing,
-            )
+            content, inp, out = openrouter_chat(api_key, MODELS["enforcement"], [
+                {"role": "system",
+                 "content": "You are a UAE enforcement action researcher. Return ONLY valid JSON."},
+                {"role": "user",
+                 "content": (
+                     "List the 3 most recent real UAE enforcement actions against companies for "
+                     "financial, fintech, crypto, or data protection violations. "
+                     "Include actions by VARA, ADGM, CBUAE, DIFC, NESA, or SCA. "
+                     "Return a JSON array where each object has exactly these keys: "
+                     '"company", "fine_amount_usd" (number only), "violation", '
+                     '"authority", "date", "details". '
+                     "Return ONLY the JSON array, no markdown, no preamble."
+                 )},
+            ])
             total_in  += inp
             total_out += out
-            mc         = calc_cost(models["enforcement"], inp, out, pricing_table=pricing)
+            mc         = calc_cost(MODELS["enforcement"], inp, out)
             total_cost += mc
-            cost_by_model[models["enforcement"]] = {"input": inp, "output": out, "cost": mc}
+            cost_by_model[MODELS["enforcement"]] = {"input": inp, "output": out, "cost": mc}
 
             parsed = extract_json(content)
             if isinstance(parsed, list):
@@ -1025,13 +1001,13 @@ def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
                         enforcements = v
                         break
             if not enforcements:
-                errors.append(f"{enf_model_label} returned unexpected format — no enforcement list parsed.")
+                errors.append("Grok returned unexpected format — no enforcement list parsed.")
             yield _p("pline-ok", f"✅ {len(enforcements)} enforcement action(s) fetched.")
         except Exception as exc:
-            errors.append(f"Enforcement model error: {exc}")
-            yield _p("pline-err", f"⚠ Enforcement model failed: {escape(str(exc)[:300])}")
+            errors.append(f"Grok error: {exc}")
+            yield _p("pline-err", f"⚠ Grok failed: {escape(str(exc)[:300])}")
 
-        # ── Build additional_regs context ──────────────────────────────────────
+        # ── Build additional context for Claude ────────────────────────────────
         additional_regs = ""
         for r in regulations:
             additional_regs += (
@@ -1047,11 +1023,10 @@ def stream_scan(repo_url, pat, api_key, is_demo=False, key_source="operator"):
         if not additional_regs.strip():
             additional_regs = "None available — use hardcoded frameworks only."
 
-        # ── Step 4: Code audit ─────────────────────────────────────────────────
-        audit_model_label = models["audit"]
+        # ── Step 4: Claude — code audit ───────────────────────────────────────
         yield _p("pline-work",
-                 f"⏳ Step 4/5: Auditing {num_files} file(s) "
-                 f'<span class="model-pill model-pill-free">{escape(audit_model_label)}</span>…')
+                 f"⏳ Step 4/5: Auditing {num_files} file(s) against "
+                 f"10 UAE laws + trending + new regulations (Claude Sonnet 4.6)…")
 
         audit_system = f"""You are a senior UAE financial compliance auditor and code security expert.
 
@@ -1074,8 +1049,8 @@ Return a JSON array of all violations. If the file has no violations, return an 
 Do not include any text outside the JSON array.
 """
 
-        audit_in  = 0
-        audit_out = 0
+        claude_in  = 0
+        claude_out = 0
 
         for i, (full_path, rel_path) in enumerate(files):
             try:
@@ -1089,17 +1064,13 @@ Do not include any text outside the JSON array.
                          f"&nbsp;&nbsp;• ({i+1}/{num_files}) "
                          f'<span class="v-file">{escape(rel_path)}</span>')
 
-                content, inp, out = openrouter_chat(
-                    api_key, models["audit"],
-                    [
-                        {"role": "system", "content": audit_system},
-                        {"role": "user",
-                         "content": f"File: {rel_path}\n\n```\n{source}\n```\n\nReturn violations JSON array:"},
-                    ],
-                    pricing_table=pricing,
-                )
-                audit_in  += inp
-                audit_out += out
+                content, inp, out = openrouter_chat(api_key, MODELS["audit"], [
+                    {"role": "system", "content": audit_system},
+                    {"role": "user",
+                     "content": f"File: {rel_path}\n\n```\n{source}\n```\n\nReturn violations JSON array:"},
+                ])
+                claude_in  += inp
+                claude_out += out
 
                 parsed = extract_json(content)
                 if isinstance(parsed, list):
@@ -1112,15 +1083,15 @@ Do not include any text outside the JSON array.
                     all_violations.append(parsed)
 
             except Exception as exc:
-                errors.append(f"Audit ({rel_path}): {exc}")
+                errors.append(f"Claude audit ({rel_path}): {exc}")
                 yield _p("pline-err",
                          f"&nbsp;&nbsp;⚠ {escape(rel_path)}: {escape(str(exc)[:250])}")
 
-        total_in  += audit_in
-        total_out += audit_out
-        ac         = calc_cost(models["audit"], audit_in, audit_out, pricing_table=pricing)
-        total_cost += ac
-        cost_by_model[models["audit"]] = {"input": audit_in, "output": audit_out, "cost": ac}
+        total_in  += claude_in
+        total_out += claude_out
+        cc         = calc_cost(MODELS["audit"], claude_in, claude_out)
+        total_cost += cc
+        cost_by_model[MODELS["audit"]] = {"input": claude_in, "output": claude_out, "cost": cc}
 
         crit_count = sum(1 for v in all_violations
                          if str(v.get("severity","")).lower() == "critical")
@@ -1128,16 +1099,11 @@ Do not include any text outside the JSON array.
                  f"✅ Audit complete — {len(all_violations)} violation(s) found "
                  f"({crit_count} critical).")
 
-        # ── Step 5: Cost summary ───────────────────────────────────────────────
-        if is_demo:
-            cost_display = ("$0.00 — free-tier models on your key"
-                            if key_source == "user"
-                            else "$0.00 — shared demo key, not charged to you")
-        else:
-            cost_display = f"${total_cost:.4f} USD"
+        # ── Step 5: Token/cost summary ─────────────────────────────────────────
         yield _p("pline-info",
                  f"✅ Step 5/5: Total tokens {total_in+total_out:,} "
-                 f"({total_in:,} input + {total_out:,} output) — Cost: {cost_display}")
+                 f"({total_in:,} input + {total_out:,} output) — "
+                 f"Total cost ${total_cost:.4f} USD")
 
     except Exception as exc:
         errors.append(f"Fatal: {exc}\n{traceback.format_exc()}")
@@ -1153,7 +1119,6 @@ Do not include any text outside the JSON array.
         total_in, total_out, total_cost, cost_by_model,
         num_files, errors,
         is_demo=is_demo,
-        key_source=key_source,
     )
 
     yield """
@@ -1173,7 +1138,7 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
-    """BYOK full scan — unchanged from original."""
+    """Original BYOK scan — unchanged."""
     repo_url = request.form.get("repo_url", "").strip()
     pat      = request.form.get("pat", "").strip()
     api_key  = request.form.get("api_key", "").strip()
@@ -1191,48 +1156,55 @@ def scan():
     )
 
 
-@app.route("/demo", methods=["POST"])
-def demo_scan():
-    """
-    Demo scan — free :free models on OpenRouter.
+# ── Demo routes ───────────────────────────────────────────────────────────────
 
-    Key resolution order:
-      1. User typed their own key into the demo form  → use it (key_source="user")
-      2. Operator set DEMO_OPENROUTER_KEY env var      → use it (key_source="operator")
-      3. Neither                                       → return 400 with clear message
-
-    In all cases:
-      • Only DEMO_MODELS (:free) are used — $0 billed regardless of whose key it is
-      • Only public repos, no PAT ever injected
-      • File cap: MAX_DEMO_FILES
-    """
-    repo_url     = request.form.get("repo_url",     "").strip() or DEMO_REPO_URL
-    user_key     = request.form.get("demo_api_key", "").strip()
-
-    if not repo_url.startswith("https://"):
-        return "Repository URL must start with https://", 400
-
-    # ── Resolve which key to use ───────────────────────────────────────────────
-    if user_key:
-        api_key    = user_key
-        key_source = "user"
-    elif DEMO_OPENROUTER_KEY:
-        api_key    = DEMO_OPENROUTER_KEY
-        key_source = "operator"
-    else:
+@app.route("/demo", methods=["GET"])
+def demo_get():
+    """Show the demo form."""
+    if not DEMO_KEY:
         return (
-            "No OpenRouter key available. "
-            "Please enter your own OpenRouter key in the demo form, "
-            "or use the full BYOK scan instead. "
-            "<a href='/'>← Back</a>",
-            400,
+            "<h2 style='font-family:sans-serif;color:#c9d1d9;background:#0a0e17;"
+            "padding:2rem'>Demo mode is not configured on this server.</h2>",
+            503,
+        )
+    return demo_index_html()
+
+
+@app.route("/demo", methods=["POST"])
+def demo_post():
+    """Run a demo scan using the shared key, with session-based rate limiting."""
+
+    # ── Guard: demo key not set ────────────────────────────────────────────────
+    if not DEMO_KEY:
+        return (
+            "<h2 style='font-family:sans-serif;color:#c9d1d9;background:#0a0e17;"
+            "padding:2rem'>Demo mode is not configured on this server.</h2>",
+            503,
         )
 
+    # ── Guard: rate limit (1 scan per browser session) ─────────────────────────
+    if session.get("demo_scan_used"):
+        return demo_ratelimit_html(), 429
+
+    # ── Validate repo choice ───────────────────────────────────────────────────
+    repo_url = request.form.get("repo_url", "").strip()
+
+    # Only allow repos from the pre-approved list
+    allowed_urls = {url for url, _ in DEMO_REPOS}
+    if repo_url not in allowed_urls:
+        # Fallback to default if something unexpected was posted
+        repo_url = DEMO_DEFAULT_REPO
+
+    # Demo mode never accepts a PAT — public repos only
+    pat = ""
+
+    # ── Mark session as consumed before streaming starts ──────────────────────
+    # (do this before yielding so the flag is set even if the client disconnects)
+    session["demo_scan_used"] = True
+    session.modified = True
+
     return Response(
-        stream_with_context(
-            stream_scan(repo_url, pat="", api_key=api_key,
-                        is_demo=True, key_source=key_source)
-        ),
+        stream_with_context(stream_scan(repo_url, pat, DEMO_KEY, is_demo=True)),
         content_type="text/html; charset=utf-8",
     )
 
@@ -1241,11 +1213,8 @@ def demo_scan():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("\n  🇦🇪 UAE Compliance Scanner")
+    demo_status = "✅ configured" if DEMO_KEY else "⚠  not set (DEMO_OPENROUTER_KEY missing)"
+    print(f"\n  🇦🇪 UAE Compliance Scanner")
     print(f"  http://0.0.0.0:{port}")
-    if _demo_available():
-        print(f"  Demo mode: ENABLED  (repo: {DEMO_REPO_URL})")
-    else:
-        print("  Demo mode: DISABLED (set DEMO_OPENROUTER_KEY env var to enable)")
-    print()
+    print(f"  Demo mode: {demo_status}\n")
     app.run(debug=False, host="0.0.0.0", port=port)
