@@ -12,6 +12,7 @@ Requirements:
     pip install flask requests gitpython
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -182,7 +183,7 @@ def _single_chat_call(
             f"{OPENROUTER_BASE}/chat/completions",
             headers=headers,
             data=json.dumps(body),
-            timeout=timeout,
+            timeout=(10, timeout),   # (connect_timeout, read_timeout)
         )
     except http_requests.exceptions.Timeout as exc:
         raise OpenRouterError(f"Request timed out after {timeout} s: {exc}") from exc
@@ -263,6 +264,39 @@ def openrouter_chat(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+def _chat_with_hard_timeout(
+    api_key:       str,
+    model:         str,
+    messages:      list[dict],
+    pricing_table: dict | None,
+    max_retries:   int,
+    timeout:       int,
+    hard_timeout:  int,
+) -> tuple[str, int, int, str]:
+    """
+    Run openrouter_chat() in a background thread with a hard wall-clock deadline.
+
+    Catches the case where a free model accepts the TCP connection but stalls
+    mid-response so the requests read-timeout never fires. The thread is
+    submitted to a ThreadPoolExecutor; if it doesn't finish within hard_timeout
+    seconds the future is abandoned and OpenRouterError is raised immediately,
+    letting the generator continue streaming.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            openrouter_chat,
+            api_key, model, messages,
+            pricing_table, max_retries, timeout,
+        )
+        try:
+            return future.result(timeout=hard_timeout)
+        except concurrent.futures.TimeoutError:
+            raise OpenRouterError(
+                f"Hard timeout: no response within {hard_timeout}s wall-clock. "
+                "Skipping batch."
+            )
+
+
 # SECTION 3 — Utility Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -443,7 +477,8 @@ def audit_file_batch(
     )
 
     try:
-        content, inp, out, model_used = openrouter_chat(
+        hard_limit = timeout + 15   # wall-clock hard kill: read-timeout + 15 s buffer
+        content, inp, out, model_used = _chat_with_hard_timeout(
             api_key,
             model,
             [
@@ -451,7 +486,9 @@ def audit_file_batch(
                 {"role": "user",   "content": combined_prompt},
             ],
             pricing_table=pricing_table,
+            max_retries=5,
             timeout=timeout,
+            hard_timeout=hard_limit,
         )
 
         if model_used != model:
@@ -1153,7 +1190,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
 
     # Demo mode: 45 s per-call timeout (free models can be slow).
     # Full BYOK scan: full 180 s.
-    api_timeout = 45 if is_demo else 180
+    api_timeout = 90 if is_demo else 180
 
     # ── Initial HTML skeleton ─────────────────────────────────────────────────
     yield f"""<!DOCTYPE html>
@@ -1397,15 +1434,26 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
             )
             yield _p("pline-work", f"&nbsp;&nbsp;• Batch {batch_idx + 1}/{len(batches)}: {names_escaped}")
 
-            violations, inp, out, model_used = audit_file_batch(
-                api_key,
-                audit_model,
-                batch,
-                audit_system,
-                pricing,
-                stats,
-                timeout=api_timeout,
-            )
+            try:
+                violations, inp, out, model_used = audit_file_batch(
+                    api_key,
+                    audit_model,
+                    batch,
+                    audit_system,
+                    pricing,
+                    stats,
+                    timeout=api_timeout,
+                )
+            except Exception as batch_exc:
+                # Catch any unexpected error so one bad batch never kills the stream
+                violations, inp, out, model_used = [], 0, 0, audit_model
+                stats.record_failure(rate_limited=False)
+                errors.append(f"Batch {batch_idx + 1} unexpected error: {batch_exc}")
+                yield _p(
+                    "pline-err",
+                    f"&nbsp;&nbsp;&nbsp;&nbsp;⚠ Batch {batch_idx + 1} unexpected error: "
+                    f"{escape(str(batch_exc)[:200])}"
+                )
 
             if model_used != audit_model:
                 yield _p(
@@ -1421,7 +1469,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     "pline-ok",
                     f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {len(violations)} violation(s) found in this batch."
                 )
-            else:
+            elif not errors or errors[-1].startswith(f"Batch {batch_idx + 1} unexpected"):
                 err_msg = (
                     "Rate limit hit (all retries exhausted)"
                     if stats.rate_limit_hits > 0
