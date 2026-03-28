@@ -154,7 +154,7 @@ def _single_chat_call(
     api_key:  str,
     model:    str,
     messages: list[dict],
-    timeout:  int = 180,
+    timeout:  int = 120,
 ) -> tuple[str, int, int]:
     """
     Execute one (non-retried) OpenRouter chat completion call.
@@ -214,7 +214,7 @@ def openrouter_chat(
     messages:      list[dict],
     pricing_table: dict | None = None,
     max_retries:   int = 5,
-    timeout:       int = 180,
+    timeout:       int = 120,
 ) -> tuple[str, int, int, str]:
     """
     Retrying OpenRouter call with exponential backoff and automatic model fallback.
@@ -455,7 +455,7 @@ def audit_file_batch(
     system_prompt: str,
     pricing_table: dict,
     stats:         ScanStats,
-    timeout:       int = 180,
+    timeout:       int = 120,
 ) -> tuple[list[dict], int, int, str]:
     """
     Audit a batch of files in a single API call.
@@ -477,7 +477,7 @@ def audit_file_batch(
     )
 
     try:
-        hard_limit = timeout + 15   # wall-clock hard kill: read-timeout + 15 s buffer
+        hard_limit = timeout + 30   # wall-clock hard kill: read-timeout + 30 s buffer
         content, inp, out, model_used = _chat_with_hard_timeout(
             api_key,
             model,
@@ -1188,9 +1188,8 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
     page_title = "Demo Scan… — UAE Compliance Scanner" if is_demo else "Scanning… — UAE Compliance Scanner"
     scan_label = "Demo scan in progress…"              if is_demo else "Scan in progress…"
 
-    # Demo mode: 45 s per-call timeout (free models can be slow).
-    # Full BYOK scan: full 180 s.
-    api_timeout = 90 if is_demo else 180
+    # Both demo and full scan: 120 s (2 minutes) per-call timeout.
+    api_timeout = 120
 
     # ── Initial HTML skeleton ─────────────────────────────────────────────────
     yield f"""<!DOCTYPE html>
@@ -1605,6 +1604,7 @@ if __name__ == "__main__":
     print(f"  Full fallback: openrouter/auto:free (last resort after paid model exhaustion)")
     print(f"  Rate limit   : {_rate_limiter._min_interval}s between requests (global)")
     print(f"  Batch size   : {DEMO_BATCH_SIZE} files/call (demo)  |  {BATCH_SIZE} files/call (full)")
+    print(f"  Timeout      : 120s per call (demo & full)  |  hard kill at 150s")
     print(f"  Retry        : up to 5 attempts with exponential backoff (1s→2→4→8→16)")
     print()
     app.run(debug=False, host="0.0.0.0", port=port)
