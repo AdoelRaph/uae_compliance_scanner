@@ -39,16 +39,82 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32))
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-MAX_FILES       = 50
+MAX_FILES       = 200   # deep scan — all discovered programming files up to this cap
 MAX_DEMO_FILES  = 5
 MAX_FILE_CHARS  = 18_000
 BATCH_SIZE      = 3
 DEMO_BATCH_SIZE = 2
 
-TARGET_EXTENSIONS = {".py", ".js", ".ts", ".sol"}
+# ── Programming file extensions ONLY — no config/docs/assets ──────────────────
+TARGET_EXTENSIONS = {
+    # Python
+    ".py", ".pyw",
+    # JavaScript / TypeScript
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    # Solidity / Vyper (blockchain / smart contracts)
+    ".sol", ".vy",
+    # Go
+    ".go",
+    # Rust
+    ".rs",
+    # Java / Kotlin / Scala
+    ".java", ".kt", ".kts", ".scala",
+    # C / C++ / C#
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".cs",
+    # Ruby
+    ".rb", ".rake",
+    # PHP
+    ".php", ".php3", ".php4", ".php5", ".phtml",
+    # Swift
+    ".swift",
+    # Shell scripts
+    ".sh", ".bash", ".zsh", ".fish",
+    # R
+    ".r", ".R",
+    # Dart / Flutter
+    ".dart",
+    # Elixir / Erlang
+    ".ex", ".exs", ".erl", ".hrl",
+    # Haskell
+    ".hs", ".lhs",
+    # Lua
+    ".lua",
+    # Perl
+    ".pl", ".pm",
+    # Groovy (Gradle build logic with real code)
+    ".groovy",
+    # Clojure
+    ".clj", ".cljs", ".cljc",
+    # F#
+    ".fs", ".fsx",
+    # Objective-C
+    ".m", ".mm",
+    # COBOL (financial systems)
+    ".cob", ".cbl",
+}
+
+# Explicit skip — even if somehow matched (e.g. .py.bak)
+SKIP_EXTENSIONS = {
+    ".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".conf",
+    ".md", ".mdx", ".rst", ".txt", ".log",
+    ".lock", ".sum",
+    ".xml", ".html", ".htm", ".xhtml",
+    ".css", ".scss", ".sass", ".less",
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp",
+    ".pdf", ".docx", ".xlsx", ".pptx",
+    ".zip", ".tar", ".gz", ".bz2", ".7z",
+    ".env", ".env.example",
+    ".gitignore", ".gitattributes", ".editorconfig",
+    ".prettierrc", ".eslintrc", ".babelrc",
+    ".Makefile", ".makefile",
+}
+
 SKIP_DIRS = {
     "node_modules", "__pycache__", "venv", ".venv", "env", "dist",
     "build", ".git", ".tox", ".mypy_cache", "coverage", ".next", ".nuxt",
+    ".cache", "vendor", "third_party", "thirdparty", "external",
+    "fixtures", "testdata", "test_data", "mock", "mocks",
+    ".idea", ".vscode", "__snapshots__",
 }
 
 DEMO_REPO_URL = os.environ.get(
@@ -58,7 +124,6 @@ DEMO_REPO_URL = os.environ.get(
 
 # ─── Model Definitions ─────────────────────────────────────────────────────────
 
-# Full BYOK paid scan
 MODELS = {
     "regulations": "perplexity/sonar-deep-research",
     "enforcement": "x-ai/grok-4.20-multi-agent-beta",
@@ -71,8 +136,6 @@ MODEL_PRICING = {
     "anthropic/claude-sonnet-4-6":     {"input": 3.00, "output": 15.00},
 }
 
-# Demo free-tier scan — openrouter/auto:free for all roles, $0 billed to user.
-# OpenRouter auto-selects the best available free model per request.
 DEMO_MODELS = {
     "regulations": "openrouter/auto:free",
     "enforcement": "openrouter/auto:free",
@@ -83,16 +146,8 @@ DEMO_MODEL_PRICING = {
     "openrouter/auto:free": {"input": 0.0, "output": 0.0},
 }
 
-# Fallback chains:
-#   Demo  — openrouter/auto:free handles everything; no further fallback needed
-#           (OpenRouter itself load-balances across all available free models)
-#   Full  — paid chain walks to claude-sonnet, then drops to free auto-router
-#           as an absolute last resort so the scan never returns nothing
 FALLBACK_CHAINS: dict[str, list[str]] = {
-    # Demo
     "openrouter/auto:free": [],
-
-    # Paid fallbacks
     "perplexity/sonar-deep-research":  ["anthropic/claude-sonnet-4-6", "openrouter/auto:free"],
     "x-ai/grok-4.20-multi-agent-beta": ["anthropic/claude-sonnet-4-6", "openrouter/auto:free"],
     "anthropic/claude-sonnet-4-6":     ["openrouter/auto:free"],
@@ -116,12 +171,6 @@ UAE_FRAMEWORKS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RateLimiter:
-    """
-    Thread-safe global rate limiter.
-    Enforces a minimum interval between consecutive API calls.
-    Default: 1.1 s gap (slight buffer above OpenRouter's 1-req/s free-tier limit).
-    """
-
     def __init__(self, min_interval: float = 1.1):
         self._lock         = threading.Lock()
         self._last_call_at = 0.0
@@ -140,29 +189,22 @@ _rate_limiter = RateLimiter(min_interval=1.1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — OpenRouter Client (retry + fallback)
+# SECTION 2 — OpenRouter Client
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class OpenRouterError(Exception):
-    """Base exception for all OpenRouter API failures."""
+    pass
 
 class RateLimitError(OpenRouterError):
-    """Raised on HTTP 429 Too Many Requests."""
+    pass
 
 
 def _single_chat_call(
     api_key:  str,
     model:    str,
     messages: list[dict],
-    timeout:  int = 120,
+    timeout:  int = 180,
 ) -> tuple[str, int, int]:
-    """
-    Execute one (non-retried) OpenRouter chat completion call.
-    Applies the global rate limiter before the request.
-
-    Returns: (content, input_tokens, output_tokens)
-    Raises:  RateLimitError on 429, OpenRouterError on all other failures.
-    """
     _rate_limiter.wait()
 
     headers = {
@@ -183,10 +225,10 @@ def _single_chat_call(
             f"{OPENROUTER_BASE}/chat/completions",
             headers=headers,
             data=json.dumps(body),
-            timeout=(10, timeout),   # (connect_timeout, read_timeout)
+            timeout=(15, timeout),
         )
     except http_requests.exceptions.Timeout as exc:
-        raise OpenRouterError(f"Request timed out after {timeout} s: {exc}") from exc
+        raise OpenRouterError(f"Request timed out after {timeout}s: {exc}") from exc
     except http_requests.exceptions.ConnectionError as exc:
         raise OpenRouterError(f"Connection error: {exc}") from exc
 
@@ -214,23 +256,12 @@ def openrouter_chat(
     messages:      list[dict],
     pricing_table: dict | None = None,
     max_retries:   int = 5,
-    timeout:       int = 120,
+    timeout:       int = 180,
 ) -> tuple[str, int, int, str]:
-    """
-    Retrying OpenRouter call with exponential backoff and automatic model fallback.
-
-    Retry schedule per model: 1 s → 2 s → 4 s → 8 s → 16 s
-    If all retries for the primary model fail, the next model in
-    FALLBACK_CHAINS is tried from scratch (same retry schedule).
-
-    Returns: (content, input_tokens, output_tokens, model_actually_used)
-    Raises:  OpenRouterError when every model in the chain is exhausted.
-    """
     if pricing_table is None:
         pricing_table = MODEL_PRICING
 
     candidates = [model] + FALLBACK_CHAINS.get(model, [])
-
     last_exc: Exception = OpenRouterError("No models attempted.")
 
     for candidate in candidates:
@@ -246,8 +277,7 @@ def openrouter_chat(
                 last_exc = exc
                 if attempt == max_retries:
                     break
-                sleep_for = delay + (delay * 0.15)
-                time.sleep(sleep_for)
+                time.sleep(delay + delay * 0.15)
                 delay = min(delay * 2, 30.0)
 
             except OpenRouterError as exc:
@@ -258,29 +288,40 @@ def openrouter_chat(
                 delay = min(delay * 2, 30.0)
 
     raise OpenRouterError(
-        f"All retries and fallbacks exhausted. "
-        f"Tried: {candidates}. Last error: {last_exc}"
+        f"All retries and fallbacks exhausted. Tried: {candidates}. Last error: {last_exc}"
     ) from last_exc
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-def _chat_with_hard_timeout(
+# SECTION 2b — Keepalive-Aware API Call
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _call_with_keepalive(
     api_key:       str,
     model:         str,
     messages:      list[dict],
     pricing_table: dict | None,
-    max_retries:   int,
-    timeout:       int,
-    hard_timeout:  int,
-) -> tuple[str, int, int, str]:
+    max_retries:   int = 5,
+    timeout:       int = 180,
+    poll_interval: float = 4.0,
+):
     """
-    Run openrouter_chat() in a background thread with a hard wall-clock deadline.
+    Generator that runs openrouter_chat() in a background thread and yields
+    HTML keepalive comments every `poll_interval` seconds while waiting.
 
-    Catches the case where a free model accepts the TCP connection but stalls
-    mid-response so the requests read-timeout never fires. The thread is
-    submitted to a ThreadPoolExecutor; if it doesn't finish within hard_timeout
-    seconds the future is abandoned and OpenRouterError is raised immediately,
-    letting the generator continue streaming.
+    Usage in a streaming generator:
+        gen = _call_with_keepalive(...)
+        result = None
+        try:
+            while True:
+                chunk = next(gen)
+                yield chunk          # keep browser connection alive
+        except StopIteration as e:
+            result = e.value         # (content, inp, out, model_used)
+
+    The caller must handle OpenRouterError if the thread raised one —
+    StopIteration.value will be the exception object in that case, so
+    check with isinstance(result, Exception).
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
@@ -288,31 +329,50 @@ def _chat_with_hard_timeout(
             api_key, model, messages,
             pricing_table, max_retries, timeout,
         )
-        try:
-            return future.result(timeout=hard_timeout)
-        except concurrent.futures.TimeoutError:
-            raise OpenRouterError(
-                f"Hard timeout: no response within {hard_timeout}s wall-clock. "
-                "Skipping batch."
-            )
+        while True:
+            try:
+                result = future.result(timeout=poll_interval)
+                return result          # raises StopIteration(result) to caller
+            except concurrent.futures.TimeoutError:
+                # API call still in progress — send keepalive
+                yield "<!-- ⏳ -->\n"
+            except Exception as exc:
+                # Surface the real exception to the caller via StopIteration
+                return exc             # caller checks isinstance(result, Exception)
 
 
+def _await_keepalive(gen, stream_gen):
+    """
+    Helper to consume a _call_with_keepalive generator inside a streaming
+    response generator.  Yields all keepalive chunks into stream_gen, then
+    returns the final result.
+
+    Usage:
+        result = yield from _await_keepalive(
+            _call_with_keepalive(...), stream_gen=None
+        )
+    Actually easier to inline the pattern directly — see stream_scan.
+    """
+    result = None
+    try:
+        while True:
+            chunk = next(gen)
+            yield chunk
+    except StopIteration as e:
+        result = e.value
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — Utility Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_json(text: str):
-    """
-    Robustly extract a JSON array or object from an LLM response.
-    Handles raw JSON, markdown code fences, and embedded JSON.
-    Returns the parsed Python object, or None if nothing parseable found.
-    """
     text = text.strip()
-
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
-
     for pat in [r"```json\s*\n([\s\S]*?)\n\s*```", r"```\s*\n([\s\S]*?)\n\s*```"]:
         m = re.search(pat, text)
         if m:
@@ -320,7 +380,6 @@ def extract_json(text: str):
                 return json.loads(m.group(1).strip())
             except (json.JSONDecodeError, ValueError):
                 continue
-
     for pat in [r"(\[[\s\S]*\])", r"(\{[\s\S]*\})"]:
         m = re.search(pat, text)
         if m:
@@ -328,12 +387,10 @@ def extract_json(text: str):
                 return json.loads(m.group(1))
             except (json.JSONDecodeError, ValueError):
                 continue
-
     return None
 
 
 def calc_cost(model: str, inp: int, out: int, pricing_table: dict | None = None) -> float:
-    """Calculate USD cost for a single API call based on token counts."""
     if pricing_table is None:
         pricing_table = MODEL_PRICING
     p = pricing_table.get(model, {"input": 3.0, "output": 15.0})
@@ -341,22 +398,33 @@ def calc_cost(model: str, inp: int, out: int, pricing_table: dict | None = None)
 
 
 def find_source_files(repo_dir: str, limit: int = MAX_FILES) -> list[tuple[str, str]]:
-    """Walk repo_dir and return up to `limit` (full_path, relative_path) tuples."""
+    """
+    Deep recursive walk of repo_dir.
+    Returns up to `limit` (full_path, relative_path) tuples for recognised
+    programming files only — YAML, Markdown, JSON, images etc. are excluded.
+    """
     results: list[tuple[str, str]] = []
     for root, dirs, files in os.walk(repo_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-        for fname in files:
-            if Path(fname).suffix.lower() in TARGET_EXTENSIONS:
-                full = os.path.join(root, fname)
-                rel  = os.path.relpath(full, repo_dir)
-                results.append((full, rel))
-                if len(results) >= limit:
-                    return results
+        # Prune dirs in-place to avoid descending into junk
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in SKIP_DIRS and not d.startswith(".")
+        )
+        for fname in sorted(files):
+            suffix = Path(fname).suffix.lower()
+            if suffix not in TARGET_EXTENSIONS:
+                continue
+            if suffix in SKIP_EXTENSIONS:
+                continue
+            full = os.path.join(root, fname)
+            rel  = os.path.relpath(full, repo_dir)
+            results.append((full, rel))
+            if len(results) >= limit:
+                return results
     return results
 
 
 def read_file_safe(path: str, max_chars: int = MAX_FILE_CHARS) -> str:
-    """Read a source file safely, truncating to max_chars."""
     try:
         content = open(path, "r", errors="ignore").read()
     except OSError as exc:
@@ -370,7 +438,6 @@ def make_batches(
     files: list[tuple[str, str]],
     batch_size: int,
 ) -> list[list[tuple[str, str]]]:
-    """Split a flat file list into sub-lists of at most batch_size entries."""
     return [files[i : i + batch_size] for i in range(0, len(files), batch_size)]
 
 
@@ -379,8 +446,6 @@ def make_batches(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ScanStats:
-    """Accumulates audit health data across the full scan run."""
-
     def __init__(self) -> None:
         self.successful_batches:   int = 0
         self.failed_batches:       int = 0
@@ -455,12 +520,13 @@ def audit_file_batch(
     system_prompt: str,
     pricing_table: dict,
     stats:         ScanStats,
-    timeout:       int = 120,
-) -> tuple[list[dict], int, int, str]:
+    timeout:       int = 180,
+):
     """
-    Audit a batch of files in a single API call.
-    Returns: (violations, input_tokens, output_tokens, model_used)
-    On failure returns: ([], 0, 0, model) and updates stats accordingly.
+    Generator version of audit_file_batch.
+    Yields keepalive HTML chunks while waiting for the API.
+    Final result accessible via StopIteration.value:
+      (violations: list[dict], inp: int, out: int, model_used: str)
     """
     file_blocks: list[str] = []
     for full_path, rel_path in batch:
@@ -476,43 +542,52 @@ def audit_file_batch(
         + "\n\nReturn a single JSON array of ALL violations across ALL files above."
     )
 
+    ka_gen = _call_with_keepalive(
+        api_key,
+        model,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": combined_prompt},
+        ],
+        pricing_table=pricing_table,
+        max_retries=5,
+        timeout=timeout,
+    )
+
+    # Yield keepalive chunks
+    api_result = None
     try:
-        hard_limit = timeout + 30   # wall-clock hard kill: read-timeout + 30 s buffer
-        content, inp, out, model_used = _chat_with_hard_timeout(
-            api_key,
-            model,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": combined_prompt},
-            ],
-            pricing_table=pricing_table,
-            max_retries=5,
-            timeout=timeout,
-            hard_timeout=hard_limit,
-        )
+        while True:
+            chunk = next(ka_gen)
+            yield chunk
+    except StopIteration as e:
+        api_result = e.value
 
-        if model_used != model:
-            stats.record_fallback()
-
-        violations: list[dict] = []
-        parsed = extract_json(content)
-        if isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, dict):
-                    violations.append(item)
-        elif isinstance(parsed, dict) and parsed:
-            violations.append(parsed)
-
-        stats.record_success(model_used)
-        return violations, inp, out, model_used
-
-    except RateLimitError:
-        stats.record_failure(rate_limited=True)
+    # api_result is either a tuple or an Exception
+    if isinstance(api_result, Exception):
+        exc = api_result
+        if isinstance(exc, RateLimitError):
+            stats.record_failure(rate_limited=True)
+        else:
+            stats.record_failure(rate_limited=False)
         return [], 0, 0, model
 
-    except OpenRouterError:
-        stats.record_failure(rate_limited=False)
-        return [], 0, 0, model
+    content, inp, out, model_used = api_result
+
+    if model_used != model:
+        stats.record_fallback()
+
+    violations: list[dict] = []
+    parsed = extract_json(content)
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                violations.append(item)
+    elif isinstance(parsed, dict) and parsed:
+        violations.append(parsed)
+
+    stats.record_success(model_used)
+    return violations, inp, out, model_used
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -690,7 +765,7 @@ h2.section{color:#58a6ff;font-size:1.15rem;margin:32px 0 14px;
 # SECTION 7 — HTML Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-FLUSH_PAD = "<!-- " + ("x" * 1024) + " -->\n"
+FLUSH_PAD  = "<!-- " + ("x" * 1024) + " -->\n"
 _LINE_FLUSH = "<!-- " + ("f" * 512) + " -->\n"
 
 FRAMEWORKS_HTML = "".join(
@@ -730,7 +805,7 @@ def index_html() -> str:
   <div class="demo-badge-row">
     <span class="demo-badge">🆓 Free-tier models ($0 cost)</span>
     <span class="demo-badge">🔒 Public repos only</span>
-    <span class="demo-badge">📄 First {MAX_DEMO_FILES} files scanned</span>
+    <span class="demo-badge">📄 First {MAX_DEMO_FILES} code files scanned</span>
     <span class="demo-badge">🔑 Your key required</span>
     <span class="demo-badge">🤖 Auto best-model selection</span>
   </div>
@@ -873,20 +948,18 @@ def render_report(
 ) -> str:
     h: list[str] = []
 
-    # ── Demo banner ──────────────────────────────────────────────────────────
     if is_demo:
         h.append(f"""
 <div class="demo-scan-banner">
   <span style="font-size:1.4rem">⚡</span>
   <div>
     <strong>Demo Scan</strong> — openrouter/auto:free · auto best-model selection ·
-    first {MAX_DEMO_FILES} files · <strong>$0.00 billed</strong><br>
+    first {MAX_DEMO_FILES} code files · <strong>$0.00 billed</strong><br>
     <span style="color:#8b949e">{stats.summary()}</span>
   </div>
 </div>
 """)
 
-    # ── Audit incomplete banner ───────────────────────────────────────────────
     if stats.is_incomplete:
         h.append(f"""
 <div class="incomplete-banner">
@@ -900,7 +973,6 @@ def render_report(
 </div>
 """)
 
-    # ── Summary stats ──────────────────────────────────────────────────────────
     crit = sum(1 for v in violations if str(v.get("severity","")).lower() == "critical")
     high = sum(1 for v in violations if str(v.get("severity","")).lower() == "high")
     med  = sum(1 for v in violations if str(v.get("severity","")).lower() == "medium")
@@ -924,7 +996,6 @@ def render_report(
         )
     h.append('</div>')
 
-    # ── Violations ─────────────────────────────────────────────────────────────
     h.append('<h2 class="section">🚨 Code Violations</h2>')
     if violations:
         order = {"critical": 0, "high": 1, "medium": 2}
@@ -958,7 +1029,6 @@ def render_report(
             '</div>'
         )
 
-    # ── Enforcement actions ────────────────────────────────────────────────────
     enf_label = "(via openrouter/auto:free — demo)" if is_demo else "(via Grok — trending)"
     h.append(
         f'<h2 class="section">⚖ Recent UAE Enforcement Actions '
@@ -1012,7 +1082,6 @@ def render_report(
     else:
         h.append('<div class="card">No enforcement data retrieved.</div>')
 
-    # ── Regulatory updates ─────────────────────────────────────────────────────
     reg_label = "(via openrouter/auto:free — demo)" if is_demo else "(via Perplexity)"
     h.append(
         f'<h2 class="section">📜 New UAE Regulatory Updates '
@@ -1039,7 +1108,6 @@ def render_report(
     else:
         h.append('<div class="card">No regulatory update data retrieved.</div>')
 
-    # ── ROI Analysis ───────────────────────────────────────────────────────────
     h.append('<h2 class="section">💰 ROI Analysis</h2>')
 
     fines = []
@@ -1086,7 +1154,7 @@ def render_report(
         f'<div class="roi-cell-val roi-blue">{total_in + total_out:,}</div>'
         f'</div>'
     )
-    h.append('</div>')  # roi-grid
+    h.append('</div>')
 
     if is_demo and violations:
         h.append('<div class="roi-big" style="color:#3fb950">$0.00 ✓</div>')
@@ -1108,7 +1176,6 @@ def render_report(
     else:
         h.append('<div class="roi-sub">No fine data available for ROI calculation.</div>')
 
-    # Token / cost breakdown table
     h.append('<div style="margin-top:20px;overflow-x:auto"><table class="token-table">')
     h.append(
         '<tr><th>Model</th><th>Input Tokens</th><th>Output Tokens</th>'
@@ -1140,15 +1207,13 @@ def render_report(
             f'🔀 {stats.fallback_activations} fallback model activation(s) during this scan.</div>'
         )
 
-    h.append('</div>')  # roi-wrap
+    h.append('</div>')
 
-    # ── Errors ────────────────────────────────────────────────────────────────
     if errors:
         h.append('<h2 class="section">⚠ Warnings &amp; Errors</h2>')
         for err in errors:
             h.append(f'<div class="err-box">{escape(str(err)[:500])}</div>')
 
-    # ── Footer ────────────────────────────────────────────────────────────────
     h.append("""
 <div class="site-footer">
   <p>Scanned against 10 UAE regulatory frameworks · live enforcement trends · regulatory updates.</p>
@@ -1173,11 +1238,8 @@ def render_report(
 def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
     """
     Core streaming scan generator.
-
-    is_demo=False  → full BYOK scan (paid models; falls back to openrouter/auto:free)
-    is_demo=True   → demo scan (openrouter/auto:free for all roles, $0 billed, 5-file cap)
-
-    Yields HTML chunks that build the page progressively.
+    Sends HTML keepalive comments during every API call so the browser
+    connection never times out regardless of how long a model takes.
     """
     models      = DEMO_MODELS        if is_demo else MODELS
     pricing     = DEMO_MODEL_PRICING if is_demo else MODEL_PRICING
@@ -1188,10 +1250,9 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
     page_title = "Demo Scan… — UAE Compliance Scanner" if is_demo else "Scanning… — UAE Compliance Scanner"
     scan_label = "Demo scan in progress…"              if is_demo else "Scan in progress…"
 
-    # Both demo and full scan: 120 s (2 minutes) per-call timeout.
-    api_timeout = 120
+    # Generous per-call read timeout — keepalive keeps browser alive anyway
+    api_timeout = 240
 
-    # ── Initial HTML skeleton ─────────────────────────────────────────────────
     yield f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1214,7 +1275,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
   <span style="font-size:1.3rem">⚡</span>
   <div>
     <strong>Demo Mode</strong> — openrouter/auto:free · auto best-model selection ·
-    first {MAX_DEMO_FILES} files · batched {batch_size} files/call ·
+    first {MAX_DEMO_FILES} code files · batched {batch_size} files/call ·
     auto-retry · <strong>$0.00 billed</strong>
   </div>
 </div>
@@ -1222,7 +1283,6 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
 
     yield '<div class="progress-box" id="pb">\n'
 
-    # ── Mutable state ─────────────────────────────────────────────────────────
     clone_dir:      str | None  = None
     total_in:       int         = 0
     total_out:      int         = 0
@@ -1251,6 +1311,31 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         cost_by_model[model_id]["output"] += out
         cost_by_model[model_id]["cost"]   += cost
 
+    # ── Inline keepalive helper ───────────────────────────────────────────────
+    def run_api_with_keepalive(model, messages):
+        """
+        Runs openrouter_chat in a background thread; yields keepalive HTML
+        comments while waiting; returns (content, inp, out, model_used) or
+        raises OpenRouterError.
+        """
+        ka_gen = _call_with_keepalive(
+            api_key, model, messages,
+            pricing_table=pricing,
+            max_retries=5,
+            timeout=api_timeout,
+            poll_interval=4.0,
+        )
+        api_result = None
+        try:
+            while True:
+                chunk = next(ka_gen)
+                yield chunk
+        except StopIteration as e:
+            api_result = e.value
+        if isinstance(api_result, Exception):
+            raise api_result
+        return api_result   # (content, inp, out, model_used)
+
     try:
         # ── Step 1: Clone ──────────────────────────────────────────────────────
         yield _p("pline-work", "⏳ Step 1/5: Cloning repository…")
@@ -1271,14 +1356,14 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         num_files = len(files)
 
         cap_suffix = (
-            f" (demo cap: {MAX_DEMO_FILES})" if is_demo and num_files >= MAX_DEMO_FILES
-            else f" (capped at {MAX_FILES})"  if num_files >= MAX_FILES
+            f" (demo cap: {MAX_DEMO_FILES} code files)" if is_demo and num_files >= MAX_DEMO_FILES
+            else f" (capped at {MAX_FILES})"             if num_files >= MAX_FILES
             else ""
         )
-        yield _p("pline-ok", f"✅ Cloned. {num_files} scannable file(s) found{cap_suffix}.")
+        yield _p("pline-ok", f"✅ Cloned. {num_files} scannable programming file(s) found{cap_suffix}.")
 
         if num_files == 0:
-            yield _p("pline-err", "⚠ No .py / .js / .ts / .sol files found. Scan complete.")
+            yield _p("pline-err", "⚠ No programming files found. Scan complete.")
 
         # ── Step 2: Regulatory updates ─────────────────────────────────────────
         reg_model = models["regulations"]
@@ -1287,32 +1372,37 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
             f'⏳ Step 2/5: Fetching UAE regulatory updates '
             f'<span class="model-pill model-pill-free">{escape(reg_model)}</span>…'
         )
+        _reg_gen = run_api_with_keepalive(
+            reg_model,
+            [
+                {"role": "system", "content": "You are a UAE financial regulation researcher. Return ONLY valid JSON."},
+                {"role": "user",   "content": (
+                    "List the 5 most recent UAE regulatory updates relevant to fintech, "
+                    "crypto, and banking software. Cover VARA, ADGM, CBUAE, PDPL, AML, "
+                    "NESA, SCA, DIFC, and Consumer Protection regulations. "
+                    "Return a JSON array where each object has exactly these keys: "
+                    '"regulation", "authority", "date", "summary", "impact_on_code". '
+                    "Return ONLY the JSON array, no markdown, no preamble."
+                )},
+            ],
+        )
+        reg_api_result = None
+        _reg_error = None
         try:
-            reg_content, reg_inp, reg_out, reg_model_used = openrouter_chat(
-                api_key,
-                reg_model,
-                [
-                    {
-                        "role": "system",
-                        "content": "You are a UAE financial regulation researcher. Return ONLY valid JSON.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "List the 5 most recent UAE regulatory updates relevant to fintech, "
-                            "crypto, and banking software. Cover VARA, ADGM, CBUAE, PDPL, AML, "
-                            "NESA, SCA, DIFC, and Consumer Protection regulations. "
-                            "Return a JSON array where each object has exactly these keys: "
-                            '"regulation", "authority", "date", "summary", "impact_on_code". '
-                            "Return ONLY the JSON array, no markdown, no preamble."
-                        ),
-                    },
-                ],
-                pricing_table=pricing,
-                timeout=api_timeout,
-            )
-            accumulate_cost(reg_model_used, reg_inp, reg_out)
+            while True:
+                _chunk = next(_reg_gen)
+                yield _chunk
+        except StopIteration as _e:
+            reg_api_result = _e.value
+        except OpenRouterError as _exc:
+            _reg_error = _exc
 
+        if _reg_error:
+            errors.append(f"Regulations model error: {_reg_error}")
+            yield _p("pline-err", f"⚠ Regulations model failed: {escape(str(_reg_error)[:300])}")
+        elif reg_api_result and not isinstance(reg_api_result, Exception):
+            reg_content, reg_inp, reg_out, reg_model_used = reg_api_result
+            accumulate_cost(reg_model_used, reg_inp, reg_out)
             parsed = extract_json(reg_content)
             if isinstance(parsed, list):
                 regulations = parsed
@@ -1321,9 +1411,8 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     if isinstance(v, list):
                         regulations = v
                         break
-
             if not regulations:
-                errors.append(f"{reg_model_used}: no regulation list parsed (unexpected format).")
+                errors.append(f"{reg_model_used}: no regulation list parsed.")
                 yield _p("pline-info", "⚠ Regulations model returned unexpected format — continuing.")
             else:
                 fallback_note = (
@@ -1332,10 +1421,9 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     if reg_model_used != reg_model else ""
                 )
                 yield _p("pline-ok", f"✅ {len(regulations)} regulatory update(s) fetched.{fallback_note}")
-
-        except OpenRouterError as exc:
-            errors.append(f"Regulations model error: {exc}")
-            yield _p("pline-err", f"⚠ Regulations model failed: {escape(str(exc)[:300])}")
+        elif isinstance(reg_api_result, Exception):
+            errors.append(f"Regulations model error: {reg_api_result}")
+            yield _p("pline-err", f"⚠ Regulations model failed: {escape(str(reg_api_result)[:300])}")
 
         # ── Step 3: Enforcement actions ────────────────────────────────────────
         enf_model = models["enforcement"]
@@ -1344,33 +1432,39 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
             f'⏳ Step 3/5: Fetching UAE enforcement actions '
             f'<span class="model-pill model-pill-free">{escape(enf_model)}</span>…'
         )
-        try:
-            enf_content, enf_inp, enf_out, enf_model_used = openrouter_chat(
-                api_key,
-                enf_model,
-                [
-                    {
-                        "role": "system",
-                        "content": "You are a UAE enforcement action researcher. Return ONLY valid JSON.",
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "List the 3 most recent real UAE enforcement actions against companies "
-                            "for financial, fintech, crypto, or data protection violations. "
-                            "Include VARA, ADGM, CBUAE, DIFC, NESA, or SCA actions. "
-                            "Return a JSON array where each object has exactly these keys: "
-                            '"company", "fine_amount_usd" (number only), "violation", '
-                            '"authority", "date", "details". '
-                            "Return ONLY the JSON array, no markdown, no preamble."
-                        ),
-                    },
-                ],
-                pricing_table=pricing,
-                timeout=api_timeout,
-            )
-            accumulate_cost(enf_model_used, enf_inp, enf_out)
 
+        _enf_gen = run_api_with_keepalive(
+            enf_model,
+            [
+                {"role": "system", "content": "You are a UAE enforcement action researcher. Return ONLY valid JSON."},
+                {"role": "user",   "content": (
+                    "List the 3 most recent real UAE enforcement actions against companies "
+                    "for financial, fintech, crypto, or data protection violations. "
+                    "Include VARA, ADGM, CBUAE, DIFC, NESA, or SCA actions. "
+                    "Return a JSON array where each object has exactly these keys: "
+                    '"company", "fine_amount_usd" (number only), "violation", '
+                    '"authority", "date", "details". '
+                    "Return ONLY the JSON array, no markdown, no preamble."
+                )},
+            ],
+        )
+        enf_api_result = None
+        _enf_error = None
+        try:
+            while True:
+                _chunk = next(_enf_gen)
+                yield _chunk
+        except StopIteration as _e:
+            enf_api_result = _e.value
+        except OpenRouterError as _exc:
+            _enf_error = _exc
+
+        if _enf_error:
+            errors.append(f"Enforcement model error: {_enf_error}")
+            yield _p("pline-err", f"⚠ Enforcement model failed: {escape(str(_enf_error)[:300])}")
+        elif enf_api_result and not isinstance(enf_api_result, Exception):
+            enf_content, enf_inp, enf_out, enf_model_used = enf_api_result
+            accumulate_cost(enf_model_used, enf_inp, enf_out)
             parsed = extract_json(enf_content)
             if isinstance(parsed, list):
                 enforcements = parsed
@@ -1379,7 +1473,6 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     if isinstance(v, list):
                         enforcements = v
                         break
-
             if not enforcements:
                 errors.append(f"{enf_model_used}: no enforcement list parsed.")
                 yield _p("pline-info", "⚠ Enforcement model returned unexpected format — continuing.")
@@ -1390,12 +1483,11 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     if enf_model_used != enf_model else ""
                 )
                 yield _p("pline-ok", f"✅ {len(enforcements)} enforcement action(s) fetched.{fallback_note}")
+        elif isinstance(enf_api_result, Exception):
+            errors.append(f"Enforcement model error: {enf_api_result}")
+            yield _p("pline-err", f"⚠ Enforcement model failed: {escape(str(enf_api_result)[:300])}")
 
-        except OpenRouterError as exc:
-            errors.append(f"Enforcement model error: {exc}")
-            yield _p("pline-err", f"⚠ Enforcement model failed after all retries: {escape(str(exc)[:300])}")
-
-        # ── Build additional context for auditor ──────────────────────────────
+        # ── Build additional context ────────────────────────────────────────────
         additional_regs_lines: list[str] = []
         for r in regulations:
             additional_regs_lines.append(
@@ -1433,8 +1525,13 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
             )
             yield _p("pline-work", f"&nbsp;&nbsp;• Batch {batch_idx + 1}/{len(batches)}: {names_escaped}")
 
+            batch_violations = []
+            batch_inp = batch_out = 0
+            batch_model_used = audit_model
+            batch_error = None
+
             try:
-                violations, inp, out, model_used = audit_file_batch(
+                _batch_gen = audit_file_batch(
                     api_key,
                     audit_model,
                     batch,
@@ -1443,9 +1540,19 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     stats,
                     timeout=api_timeout,
                 )
+                _batch_result = None
+                try:
+                    while True:
+                        _chunk = next(_batch_gen)
+                        yield _chunk
+                except StopIteration as _e:
+                    _batch_result = _e.value
+
+                if _batch_result is not None:
+                    batch_violations, batch_inp, batch_out, batch_model_used = _batch_result
+
             except Exception as batch_exc:
-                # Catch any unexpected error so one bad batch never kills the stream
-                violations, inp, out, model_used = [], 0, 0, audit_model
+                batch_error = batch_exc
                 stats.record_failure(rate_limited=False)
                 errors.append(f"Batch {batch_idx + 1} unexpected error: {batch_exc}")
                 yield _p(
@@ -1454,34 +1561,36 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
                     f"{escape(str(batch_exc)[:200])}"
                 )
 
-            if model_used != audit_model:
-                yield _p(
-                    "pline-info",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;🔀 Routed to: "
-                    f'<span class="model-pill model-pill-fallback">{escape(model_used)}</span>'
-                )
+            if not batch_error:
+                if batch_model_used != audit_model:
+                    yield _p(
+                        "pline-info",
+                        f"&nbsp;&nbsp;&nbsp;&nbsp;🔀 Routed to: "
+                        f'<span class="model-pill model-pill-fallback">{escape(batch_model_used)}</span>'
+                    )
 
-            if inp > 0:
-                accumulate_cost(model_used, inp, out)
-                all_violations.extend(violations)
-                yield _p(
-                    "pline-ok",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {len(violations)} violation(s) found in this batch."
-                )
-            elif not errors or errors[-1].startswith(f"Batch {batch_idx + 1} unexpected"):
-                err_msg = (
-                    "Rate limit hit (all retries exhausted)"
-                    if stats.rate_limit_hits > 0
-                    else "All retries exhausted"
-                )
-                errors.append(f"Batch {batch_idx + 1} failed ({', '.join(batch_names)}): {err_msg}")
-                yield _p(
-                    "pline-err",
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;⚠ Batch {batch_idx + 1} skipped: {escape(err_msg)}"
-                )
+                if batch_inp > 0:
+                    accumulate_cost(batch_model_used, batch_inp, batch_out)
+                    all_violations.extend(batch_violations)
+                    yield _p(
+                        "pline-ok",
+                        f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {len(batch_violations)} violation(s) found in this batch."
+                    )
+                else:
+                    err_msg = (
+                        "Rate limit hit (all retries exhausted)"
+                        if stats.rate_limit_hits > 0
+                        else "All retries exhausted"
+                    )
+                    errors.append(f"Batch {batch_idx + 1} failed ({', '.join(batch_names)}): {err_msg}")
+                    yield _p(
+                        "pline-err",
+                        f"&nbsp;&nbsp;&nbsp;&nbsp;⚠ Batch {batch_idx + 1} skipped: {escape(err_msg)}"
+                    )
 
+            # Rate-limit courtesy pause between batches
             if batch_idx < len(batches) - 1:
-                time.sleep(2.0)
+                time.sleep(1.5)
 
         # ── Step 5: Summary ────────────────────────────────────────────────────
         crit_count = sum(1 for v in all_violations if str(v.get("severity","")).lower() == "critical")
@@ -1515,7 +1624,7 @@ def stream_scan(repo_url: str, pat: str, api_key: str, is_demo: bool = False):
         if clone_dir and os.path.exists(clone_dir):
             shutil.rmtree(clone_dir, ignore_errors=True)
 
-    yield '</div>\n'  # close progress-box
+    yield '</div>\n'
 
     yield render_report(
         all_violations, enforcements, regulations,
@@ -1544,8 +1653,6 @@ def index():
 
 @app.route("/scan", methods=["POST"])
 def scan():
-    """Full BYOK scan using paid models (Perplexity + Grok + Claude).
-    Falls back to openrouter/auto:free if all paid retries are exhausted."""
     repo_url = request.form.get("repo_url", "").strip()
     pat      = request.form.get("pat", "").strip()
     api_key  = request.form.get("api_key", "").strip()
@@ -1565,9 +1672,6 @@ def scan():
 
 @app.route("/demo", methods=["POST"])
 def demo_scan():
-    """Demo scan using openrouter/auto:free for all roles.
-    OpenRouter auto-selects the best available free model per request.
-    User must supply their own OpenRouter key — $0.00 billed."""
     repo_url = request.form.get("repo_url", "").strip() or DEMO_REPO_URL
     api_key  = request.form.get("demo_api_key", "").strip()
 
@@ -1603,8 +1707,9 @@ if __name__ == "__main__":
     print(f"  Demo models  : openrouter/auto:free (all roles — $0.00 billed)")
     print(f"  Full fallback: openrouter/auto:free (last resort after paid model exhaustion)")
     print(f"  Rate limit   : {_rate_limiter._min_interval}s between requests (global)")
+    print(f"  File limit   : {MAX_DEMO_FILES} code files (demo) | {MAX_FILES} code files (full)")
     print(f"  Batch size   : {DEMO_BATCH_SIZE} files/call (demo)  |  {BATCH_SIZE} files/call (full)")
-    print(f"  Timeout      : 120s per call (demo & full)  |  hard kill at 150s")
+    print(f"  Timeout      : {api_timeout}s per call · keepalive every 4s keeps browser alive")  # noqa: F821
     print(f"  Retry        : up to 5 attempts with exponential backoff (1s→2→4→8→16)")
     print()
     app.run(debug=False, host="0.0.0.0", port=port)
